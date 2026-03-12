@@ -1,0 +1,7 @@
+node_modules/
+.env
+dist/
+npm-debug.log*
+# If you still have Python stuff:
+__pycache__/
+.venv/
