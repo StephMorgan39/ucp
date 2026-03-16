@@ -149,12 +149,18 @@ async function main() {
         const sku = stgRec.getCellValueAsString("fldeEd9FiNq5AtGNk").trim().toUpperCase();
 
         // If the row was held by Script 0B and matches an approved anomaly, release it
-        if (status === "pending_review" && approvedSkus.includes(sku)) {
+        if (
+            status === "pending_review" &&
+            approvedSkus.includes(sku) &&
+            !alreadyReleased.has(sku)
+        ) {
+            alreadyReleased.add(sku);
             stagingUpdates.push({
                 id: stgRec.id,
                 fields: { "fldbrUDvLv8OEnEqh": { name: "pending" } }
             });
         }
+        
     }
 
     if (stagingUpdates.length > 0) {

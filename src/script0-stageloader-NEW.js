@@ -35,12 +35,12 @@ async function main() {
     
     const CANONICAL_TO_STAGING = {
         "424": "fldeEd9FiNq5AtGNk", "356": "fldkAm1iLOJJYmzmi", "292": "fldvZjLna62iMbj5K", 
-        "422": "fldbgiMR2Qlm169Mu", "296": "fldIEO5cTzgLSSOC0", "362": "fldIEO5cTzgLSSOC0", 
+        "422": "fldbgiMR2Qlm169Mu", "362": "fldIEO5cTzgLSSOC0", "427": "fldslE6XEO2Lqi4Qd",
         "483": "fld4QhEwwFSgFsHRB", "299": "fldkh9EFaIKvc0yIj", "300": "fldqFzEPIby2C94Du", 
         "304": "fldfMSgqnPwP2hvtl", "306": "fldiTSUcLPa4uLT4L", "307": "fldvVC9z72GqYdDko", 
         "479": "fldS2mZdWoY7hPU3G", "480": "fld8Qz10GgXiS6Da5", "481": "fldf5VU6KDd2cSqUB", 
         "390": "fldOfxvmWk1K1J0TQ", "371": "fldhNujCBWdylBEzS", "375": "fldHDkQCH8jKeJZ7g", 
-        "376": "fldMP2ywTGMepEX9K"
+        "376": "fldMP2ywTGMepEX9K", "427": "fldslE6XEO2Lqi4Qd", 
     };
 
     const manifestQuery = await manifestTable.selectRecordsAsync({
