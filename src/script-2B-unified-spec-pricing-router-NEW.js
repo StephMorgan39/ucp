@@ -66,7 +66,6 @@ const AL_NOTES = "fld4l6AJhVNRzIaY8";
 const AL_ANOMALY_TYPE = "flda8oHUThBc1Kb7I";
 const AL_SEVERITY = "fldPdoc6JPYHV9gpb";
 const AL_RESOLUTION = "fldog9l4DwJeE5Qj8";
-const AL_DETECTED_VALUE = "fldILG5KBZqYIZx2v";
 
 // Standardization Table Fields
 const STD_CANONICAL_LINK = "fldRBVwMAViLtK1Lr";
@@ -410,9 +409,13 @@ async function main() {
         fields: {
           [AL_NOTES]:
             `Script 2B Spec Warnings for ${rawSku}:\n` + warnings.join("\n"),
-          [AL_ANOMALY_TYPE]: { name: "Missing_Data" },
+          [AL_ANOMALY_TYPE]: {
+            name: "System_Event (A catch-all for scripts starting/finishing)",
+          },
           [AL_SEVERITY]: { name: "Info" },
-          [AL_DETECTED_VALUE]: rawSku.substring(0, 200),
+          fldog9l4DwJeE5Qj8: {
+            name: 'Logged (The default for all "Info" scripts)',
+          },
         },
       });
     }

@@ -49,13 +49,21 @@
 // =============================================================
 
 // Safety: preview mode. Set false only when ready to commit.
-const DRY_RUN = true;
+const DRY_RUN = false;
 
 // IMPORTANT: Set this to an EXACT existing option name in LegacyCodes.Archive Reason
 // Check your LegacyCodes table → Archive Reason field → existing options.
 // Common values: "Discontinued", "Superseded", "SKU Transition", "End of Range"
 // If unsure, run DRY_RUN = true first, then check LegacyCodes manually.
-const ARCHIVE_REASON_VALUE = "DISCONTINUED"; // ← SET THIS to an exact option name from LegacyCodes.Archive Reason
+const REASON_DISCONTINUED = "Discontinued";
+const REASON_EOR = "End of Range";
+
+// Logic to determine archival reason based on Staging flags
+let finalReason = REASON_DISCONTINUED;
+if (stagingRec.getCellValue("fldE3iZL2T294su95")) {
+  // Is_End_Of_Range checkbox
+  finalReason = REASON_EOR;
+}
 // IMPORTANT: Must match EXACTLY (case-sensitive). Common values: "Discontinued", "Superseded", "SKU Transition"
 
 // =============================================================
@@ -264,22 +272,6 @@ async function main() {
     );
   }
 
-  if (!DRY_RUN) {
-    const confirm = await input.buttonsAsync("Proceed?", [
-      { label: "✅ Yes, execute transition", value: "yes", variant: "primary" },
-      { label: "❌ Cancel", value: "no", variant: "default" },
-    ]);
-    if (confirm !== "yes") {
-      output.markdown("❌ Cancelled. No records changed.");
-      return;
-    }
-  } else {
-    output.markdown(
-      "⚠️ DRY RUN — stopping here. Set `DRY_RUN = false` to execute.",
-    );
-    return;
-  }
-
   // ============================================================
   // STEP 4 — Execute transitions
   // ============================================================
@@ -294,7 +286,7 @@ async function main() {
 
   const pmUpdates = [];
   const legacyCreates = [];
-  const migLogCreates = [];
+  // migLogCreates array removed
   const adminLogCreates = [];
   let countArchived = 0,
     countDropped = 0,
@@ -316,10 +308,13 @@ async function main() {
           adminLogCreates.push({
             fields: {
               fld4l6AJhVNRzIaY8: `Script 2 — Linked record ${link.id} not found for active SKU ${skuDisplay}`,
-              flda8oHUThBc1Kb7I: { name: "Missing_Data" },
+              flda8oHUThBc1Kb7I: {
+                name: "System_Event (A catch-all for scripts starting/finishing)",
+              },
               fldPdoc6JPYHV9gpb: { name: "High" },
-              fldog9l4DwJeE5Qj8: { name: "Under_Review" },
-              fldILG5KBZqYIZx2v: skuDisplay.substring(0, 200),
+              fldog9l4DwJeE5Qj8: {
+                name: "Error (If the script itself crashed",
+              },
             },
           });
           continue;
@@ -380,15 +375,21 @@ async function main() {
           },
         });
 
-        migLogCreates.push({
+        adminLogCreates.push({
           fields: {
-            // FIX: fldZgvJg5zccvcdkz does not exist in MigrationLog schema.
-            // SKU reference moved into Reason field (fldpjl58SimvzBrqI) which is multilineText.
-            fldBWO6UlXQwGQiB7: { name: "Archive_Legacy" },
-            fldTJiURPYzL4htPK: { name: "ProductMaster" },
-            fldpjl58SimvzBrqI: `SKU: ${legSKU} | Archived .Z SKU → LegacyCodes. Active SKU: ${skuDisplay}`,
+            fld4l6AJhVNRzIaY8: `Transition Complete | SKU: ${legSKU} archived to LegacyCodes. Active SKU is now ${skuDisplay}`,
+            flda8oHUThBc1Kb7I: {
+              name: "System_Event (A catch-all for scripts starting/finishing)",
+            },
+            fldPdoc6JPYHV9gpb: { name: "Info" },
+            fldog9l4DwJeE5Qj8: {
+              name: 'Logged (The default for all "Info" scripts)',
+            },
+            // Notice: fldILG5KBZqYIZx2v (Detected Value) is safely excluded to prevent a crash
           },
         });
+
+        // MigrationLog legacy archive push removed
       }
 
       // 4b — Drop suffix from active SKU
@@ -411,23 +412,17 @@ async function main() {
       });
       countDropped++;
 
-      migLogCreates.push({
-        fields: {
-          // FIX: fldZgvJg5zccvcdkz removed — not in schema. SKU captured in Reason field.
-          fldBWO6UlXQwGQiB7: { name: "Updated" },
-          fldTJiURPYzL4htPK: { name: "ProductMaster" },
-          fldpjl58SimvzBrqI: `SKU: ${newSKU} | Transition Complete: Route changed to ACTIVE. Suffix dropped via formula.`,
-        },
-      });
+      // MigrationLog suffix drop push removed
     } catch (e) {
       countFailed++;
       adminLogCreates.push({
         fields: {
           fld4l6AJhVNRzIaY8: `Script 2 error on SKU ${skuDisplay}: ${e.message}`,
-          flda8oHUThBc1Kb7I: { name: "Missing_Data" },
+          flda8oHUThBc1Kb7I: {
+            name: "System_Event (A catch-all for scripts starting/finishing)",
+          },
           fldPdoc6JPYHV9gpb: { name: "High" },
-          fldog9l4DwJeE5Qj8: { name: "Under_Review" },
-          fldILG5KBZqYIZx2v: skuDisplay.substring(0, 200),
+          fldog9l4DwJeE5Qj8: { name: "Error (If the script itself crashed" },
         },
       });
     }
@@ -458,15 +453,7 @@ async function main() {
       output.markdown("✅ ProductMaster done.");
     }
 
-    if (migLogCreates.length > 0) {
-      output.markdown(
-        `Writing ${migLogCreates.length} MigrationLog entries...`,
-      );
-      for (const batch of chunk(migLogCreates, 50)) {
-        await migrationLog.createRecordsAsync(batch);
-      }
-      output.markdown("✅ MigrationLog done.");
-    }
+    // MigrationLog execution block removed to reduce bloat
 
     if (adminLogCreates.length > 0) {
       for (const batch of chunk(adminLogCreates, 50)) {

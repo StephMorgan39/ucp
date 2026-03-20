@@ -32,7 +32,7 @@
 //   Anomalies record per proposed PLU:
 //     Anomaly Type  = "PLU_Ready"
 //     Detected Value = proposed PLU string
-//     Notes          = "Proposed new PLU for [Name]: [PLU]. 
+//     Notes          = "Proposed new PLU for [Name]: [PLU].
 //                       Awaiting manual operator entry into ProductMaster."
 //
 // NINA'S WORKFLOW AFTER THIS SCRIPT:
@@ -46,88 +46,86 @@
 // =============================================================
 // TABLE IDs  — confirm UPC table IDs against your Airtable base
 // =============================================================
-const PM_TABLE_ID           = "tblgLqMMXX2HcKt9U";
-const SPD_TABLE_ID          = "tbl7mZpHJCUs1r0cg";
-const UPC_BODY_CLASS_TBL_ID = "tblTKGGHdw9pUD0yR";     // ← replace with real ID
-const ANOMALIES_TABLE_ID    = "tbl56i9Rlm2mK6t1w";
-const ADMIN_LOGS_TABLE_ID   = "tblk1v5VHPEC2c2u2";
+const PM_TABLE_ID = "tblgLqMMXX2HcKt9U";
+const SPD_TABLE_ID = "tbl7mZpHJCUs1r0cg";
+const UPC_BODY_CLASS_TBL_ID = "tblTKGGHdw9pUD0yR"; // ← replace with real ID
+const ANOMALIES_TABLE_ID = "tbl56i9Rlm2mK6t1w";
+const ADMIN_LOGS_TABLE_ID = "tblk1v5VHPEC2c2u2";
 
 // =============================================================
 // PM FIELD IDs
 // =============================================================
-const PM_SKU_MASTER_FID     = "fldMfK3uyPnDbKONn";   // Product SKU Master (PLU — do not write)
-const PM_NAME_FID           = "fld7hdhxyu61r5Olm";   // FIX: was fldVN8HH5cJX2SBVH (not in schema) — correct field is Product Description
-const PM_STATUS_FID         = "flddq6S7409EBM71D";   // Product_Status
-const PM_SPD_LINK_FID       = "fldxZcpnCCCYW5zHx";   // FIX: was fldGxaIlPVor7QEwN (SPD→PM direction, wrong side) — PM→SPD link
-const PM_UBC_LINK_FID       = "fldyrCQE5L3lQktS3";   // FIX: was fldzBkUc1dqtsRbvj (not in schema) — correct PM→UPCBodyClass link
-const PM_COLOUR_LINK_FID    = "fldDBJifgrvsMqR9g";   // UPCColourMaster link
-const PM_SIZE_LENGTH_FID    = "fld0UAx6ANs6ukXmE";   // FIX: fldQns7cT9JDqHy0Z is SPD's size field; PM has multipleLookupValues Size Length MM → fld0UAx6ANs6ukXmE
-const PM_SIZE_WIDTH_FID     = "flddQpgGUlSOJlfBk";   // FIX: same — PM's Size Width MM lookup → flddQpgGUlSOJlfBk
+const PM_SKU_MASTER_FID = "fldMfK3uyPnDbKONn"; // Product SKU Master (PLU — do not write)
+const PM_NAME_FID = "fld7hdhxyu61r5Olm"; // FIX: was fldVN8HH5cJX2SBVH (not in schema) — correct field is Product Description
+const PM_STATUS_FID = "flddq6S7409EBM71D"; // Product_Status
+const PM_SPD_LINK_FID = "fldxZcpnCCCYW5zHx"; // FIX: was fldGxaIlPVor7QEwN (SPD→PM direction, wrong side) — PM→SPD link
+const PM_UBC_LINK_FID = "fldyrCQE5L3lQktS3"; // FIX: was fldzBkUc1dqtsRbvj (not in schema) — correct PM→UPCBodyClass link
+const PM_COLOUR_LINK_FID = "fldDBJifgrvsMqR9g"; // UPCColourMaster link
+const PM_SIZE_LENGTH_FID = "fld0UAx6ANs6ukXmE"; // FIX: fldQns7cT9JDqHy0Z is SPD's size field; PM has multipleLookupValues Size Length MM → fld0UAx6ANs6ukXmE
+const PM_SIZE_WIDTH_FID = "flddQpgGUlSOJlfBk"; // FIX: same — PM's Size Width MM lookup → flddQpgGUlSOJlfBk
 
 // =============================================================
 // UPCBodyClass FIELD IDs
 // =============================================================
-const UBC_CATEGORY_NO_FID   = "flddbKj9I5DhNRLsx";   // Category No (e.g. "01", "04")
+const UBC_CATEGORY_NO_FID = "flddbKj9I5DhNRLsx"; // Category No (e.g. "01", "04")
 const UBC_PROD_CATEGORY_FID = "fldVS7MdpvEAx7jkK";
-
-
 
 // =============================================================
 // SPD FIELD IDs (needed to read supplier SKU for BBBB logic)
 // =============================================================
-const SPD_SKU_FID           = "fldK3FyPA98F3smc9";   // Supplier SKU
+const SPD_SKU_FID = "fldK3FyPA98F3smc9"; // Supplier SKU
 
 // =============================================================
 // Anomalies FIELD IDs
 // =============================================================
-const ANOM_ERROR_TYPE_FID   = "fldjYiDzJmdYJp6uF";   // Error Type (singleSelect)
-const ANOM_DETECTED_VAL_FID = "fld0wlmRbNFgVpbXS";   // Original Value / Detected Value
-const ANOM_NOTES_FID        = "fldB7o9RtnQPi4goY";   // Notes
-const ANOM_SEVERITY_FID     = "fld3TPgysD2hLbtvR";   // Error Severity
-const ANOM_DETECTED_BY_FID  = "fldbPrkOy6XavA4ef";   // Detected By
-const ANOM_RESOLUTION_FID   = "fld4li4vcLn43h2N4";   // Resolution Status
-const ANOM_DATE_FID         = "fldE7JCdKubLvxysd";   // Date Detected
+const ANOM_ERROR_TYPE_FID = "fldjYiDzJmdYJp6uF"; // Error Type (singleSelect)
+const ANOM_DETECTED_VAL_FID = "fld0wlmRbNFgVpbXS"; // Original Value / Detected Value
+const ANOM_NOTES_FID = "fldB7o9RtnQPi4goY"; // Notes
+const ANOM_SEVERITY_FID = "fld3TPgysD2hLbtvR"; // Error Severity
+const ANOM_DETECTED_BY_FID = "fldbPrkOy6XavA4ef"; // Detected By
+const ANOM_RESOLUTION_FID = "fld4li4vcLn43h2N4"; // Resolution Status
+const ANOM_DATE_FID = "fldE7JCdKubLvxysd"; // Date Detected
 
 // PLU constant
-const SUPPLIER_CODE         = "163";
+const SUPPLIER_CODE = "163";
 
 // =============================================================
 // HELPERS
 // =============================================================
 
 function zeroPad(n, width) {
-    return String(n).padStart(width, "0");
+  return String(n).padStart(width, "0");
 }
 
 // Old-style Decobella SKU: NNNN-XXX  e.g. "0573-BGE"
 function isOldStyleSku(sku) {
-    return /^\d{4}-[A-Z0-9./]+$/i.test(sku.trim());
+  return /^\d{4}-[A-Z0-9./]+$/i.test(sku.trim());
 }
 
 // Extract BBBB from old-style SKU
 function extractBBBB(sku) {
-    return sku.trim().substring(0, 4);
+  return sku.trim().substring(0, 4);
 }
 
 // New-style SKU group key: everything except the colour suffix
 // EQP-COCO515-GLS-BLK  →  COCO515-GLS
 // EQP-MNC1010-BSLGN    →  MNC1010  (single segment after EQP)
 function extractNewStyleGroupKey(sku) {
-    const parts = sku.trim().toUpperCase().split("-");
-    const filtered = parts[0] === "EQP" ? parts.slice(1) : parts;
-    if (filtered.length < 2) return filtered.join("-");
-    return filtered.slice(0, -1).join("-");
+  const parts = sku.trim().toUpperCase().split("-");
+  const filtered = parts[0] === "EQP" ? parts.slice(1) : parts;
+  if (filtered.length < 2) return filtered.join("-");
+  return filtered.slice(0, -1).join("-");
 }
 
 // Parse TT + BBBB + N from an existing PLU string
 // 163 + TT(2) + BBBB(4) + N(1-2)
 function parsePlu(plu) {
-    const s = String(plu).trim();
-    if (!s.startsWith("163") || s.length < 10) return null;
-    const tt   = s.substring(3, 5);
-    const bbbb = s.substring(5, 9);
-    const n    = parseInt(s.substring(9), 10) || 0;
-    return { tt, bbbb, n };
+  const s = String(plu).trim();
+  if (!s.startsWith("163") || s.length < 10) return null;
+  const tt = s.substring(3, 5);
+  const bbbb = s.substring(5, 9);
+  const n = parseInt(s.substring(9), 10) || 0;
+  return { tt, bbbb, n };
 }
 
 // =============================================================

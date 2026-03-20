@@ -46,7 +46,7 @@ async function main() {
       "fldOdvbGYRzfU6VmS", // Field Name
       "fldm5CSkaVnCXIxOt", // Example Input
       "fldBmRaivNGM1s7bS", // Example Output
-      "fldMdFNMxdnM7SkO0", // Automated Standardization Feasible
+      "fldid3LYwJeC8bx7e", // Automated Standardization Feasible
     ],
   });
 
@@ -54,7 +54,7 @@ async function main() {
   let stdRulesLoaded = 0;
 
   for (const r of stdQuery.records) {
-    const feasible = r.getCellValueAsString("fldMdFNMxdnM7SkO0");
+    const feasible = r.getCellValueAsString("fldid3LYwJeC8bx7e");
     const category = r
       .getCellValueAsString("fldKYwVJHHTfloR8h")
       .trim()
@@ -179,7 +179,7 @@ async function main() {
       "fldqkhCrXeaEsmKuQ", // Dimensions_Raw
       "fldQns7cT9JDqHy0Z", // Size Length MM
       "fldeQy5c79koW7ABQ", // Size Width MM
-      "fld1eoLeHEOE5MfiG", // Stock Status (singleSelect) — RESTORED v1.7: IS real SPD field
+      "fldK2EV1veOvEkCpu", // SPD Stock Status (singleSelect) - Corrected Schema Field ID applied
       // Logistics Fields
       "fldSgGBl9MmbFNgfi", // Pce Box
       "fldv7C2yxJqMMwy71", // Sqm Box
@@ -558,9 +558,11 @@ async function main() {
       });
       await adminLogs.createRecordAsync({
         fld4l6AJhVNRzIaY8: `Script 1 failure - SKU ${rawSku}: ${err.message}`,
-        flda8oHUThBc1Kb7I: { name: "Missing_Data" },
+        flda8oHUThBc1Kb7I: {
+          name: "System_Event (A catch-all for scripts starting/finishing)",
+        },
         fldPdoc6JPYHV9gpb: { name: "High" },
-        fldILG5KBZqYIZx2v: rawSku.substring(0, 200),
+        fldog9l4DwJeE5Qj8: { name: "Error (If the script itself crashed" }, // Matched exact schema string (including missing parenthesis)
       });
     }
   }

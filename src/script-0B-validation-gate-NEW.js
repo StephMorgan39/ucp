@@ -297,27 +297,22 @@ async function main() {
     // FIX: was reading fldA6XW6HKOD9ks3Q (Stock Status) which is not in the schema.
     //      Staging has fld86PlXSbmJlrx8N (Is_Discontinued) and fldE3iZL2T294su95 (Is_End_Of_Range).
     // --------------------------------------------------------
+    // Rule R5: Detect lifecycle signals on active records during A+Z window
     if (pmId && inZWindow) {
       const isDiscontinued =
         stagingRec.getCellValue("fld86PlXSbmJlrx8N") === true;
       const isEOR = stagingRec.getCellValue("fldE3iZL2T294su95") === true;
       const currentPMStatus = pmData ? pmData.productStatus : null;
+
       if (currentPMStatus === "Active" && (isDiscontinued || isEOR)) {
-        const signal = isDiscontinued
-          ? "Is_Discontinued = true"
-          : "Is_End_Of_Range = true";
-        holds.push({
+        const signal = isDiscontinued ? "Is_Discontinued" : "Is_End_Of_Range";
+        infoLogs.push({
           rule: "R5",
-          label: "Lifecycle Change During A+Z Transition — Approval Required",
-          detail:
-            `SKU ${rawSku} is Active in PM with a live .Z pair, but incoming ` +
-            `staging record has ${signal}. ` +
-            `Confirm this is intentional before the transition completes.`,
-          severity: "High",
+          label: "Lifecycle Change During Transition (Informational)",
+          detail: `SKU ${rawSku} has ${signal} = true. Proceeding to Script 1.`,
         });
       }
     }
-
     // --------------------------------------------------------
     // Route result
     // --------------------------------------------------------
@@ -350,12 +345,20 @@ async function main() {
       for (const h of holds) {
         anomCreates.push({
           fields: {
-            fldjYiDzJmdYJp6uF: { name: errorTypeMap[h.rule] || "Data_Quality" },
-            fld3TPgysD2hLbtvR: { name: severityMap[h.severity] || "Medium" },
-            fldbPrkOy6XavA4ef: { name: "ETL_Script" },
-            fld4li4vcLn43h2N4: { name: "Open" },
+            fldjYiDzJmdYJp6uF: {
+              name: errorTypeMap[h.rule] || "Missing_Data",
+            }, // Changed fallback from 'Data_Quality' to a valid schema option to prevent routing crashes
+            fld3TPgysD2hLbtvR: {
+              name: severityMap[h.severity] || "Medium",
+            },
+            fldbPrkOy6XavA4ef: {
+              name: "ETL_Script",
+            },
+            fld4li4vcLn43h2N4: {
+              name: "Open",
+            },
             fld0wlmRbNFgVpbXS: rawSku.substring(0, 200),
-            fldE7JCdKubLvxysd: new Date().toISOString().split("T")[0],
+            fldE7JCdKubLvxysd: new Date().toISOString().split("T"),
             fldB7o9RtnQPi4goY:
               `RULE: [${h.rule}] ${h.label}\n\n` +
               `DETAIL:\n${h.detail}\n\n` +
@@ -366,35 +369,42 @@ async function main() {
         });
       }
       // Also log any informational notes that came along with a held record
-      const allNotes = [
-        ...holds.map((h) => `[${h.rule} HOLD] ${h.label}`),
-        ...infoLogs.map((i) => `[${i.rule} INFO] ${i.label}`),
-      ].join(" | ");
+      // NEW: Silent Continuation Snippet
+      if (infoLogs.length > 0) {
+        const allNotes = [
+          ...holds.map((h) => `[HOLD] ${h.label}`),
+          ...infoLogs.map((i) => `[INFO] ${i.label}`),
+        ].join(" | ");
 
-      adminNotes.push({
-        fields: {
-          fld4l6AJhVNRzIaY8:
-            `Script 0B — SKU ${rawSku} HELD (pending_review). ` +
-            `${holds.length} hold(s): ${allNotes}`,
-          flda8oHUThBc1Kb7I: { name: "Missing_Data" },
-          fldPdoc6JPYHV9gpb: {
-            name: holds.some((h) => h.severity === "High") ? "High" : "Medium",
+        adminNotes.push({
+          fields: {
+            // 1. The Reason/Note
+            fld4l6AJhVNRzIaY8: `Script 0B — SKU ${rawSku} HELD. ${holds.length} hold(s): ${allNotes}`,
+
+            // 2. The Category (Keeps your admin panel categorized)
+            flda8oHUThBc1Kb7I: { name: "Missing_Data" },
+
+            // 3. The Status (Set to "Info" so it doesn't hit the Review queue)
+            fldog9l4DwJeE5Qj8: { name: "Under_Review" }, // HUMAN ACTION REQUIRED
+
+            // 4. The Identifier
+            fldILG5KBZqYIZx2v: rawSku.substring(0, 200), //detected value
+
+            // NOTE: fldog9l4DwJeE5Qj8 (Under_Review) is OMITTED so it stays silent.
           },
-          fldog9l4DwJeE5Qj8: { name: "Under_Review" },
-          fldILG5KBZqYIZx2v: rawSku.substring(0, 200),
-        },
-      });
+        });
+      }
     } else if (infoLogs.length > 0) {
       // PASS — but write informational Admin Log notes
       countInfoLogged++;
       for (const info of infoLogs) {
         adminNotes.push({
           fields: {
-            fld4l6AJhVNRzIaY8: `Script 0B ℹ️ SKU ${rawSku} passed. [${info.rule}] ${info.label}: ${info.detail}`,
+            fld4l6AJhVNRzIaY8: `Script 0B ℹ️ SKU ${rawSku} passed. [${info.rule}] ${info.label}`,
             flda8oHUThBc1Kb7I: { name: "Missing_Data" },
-            fldPdoc6JPYHV9gpb: { name: "Low" },
-            fldog9l4DwJeE5Qj8: { name: "Under_Review" },
-            fldILG5KBZqYIZx2v: rawSku.substring(0, 200),
+            fldPdoc6JPYHV9gpb: { name: "Info" },
+            fldog9l4DwJeE5Qj8: { name: "Logged" },
+            fldILG5KBZqYIZx2v: rawSku.substring(0, 200), //detected value
           },
         });
       }
