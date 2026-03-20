@@ -1,115 +1,157 @@
-// =============================================================
-// SCRIPT 3 — PLU GENERATOR v2.0  (Proposal Engine)
-// Utile Solutions PIM | Revised: March 2026
-// =============================================================
-//
-// WHAT THIS SCRIPT DOES:
-//   Queries ProductMaster for records with Status = "NEW PRODUCTS",
-//   validates that required enrichment fields are populated,
-//   assembles a proposed PLU, and logs it to Anomalies for
-//   human review. It NEVER writes to Product_SKU_Master directly.
-//
-// PLU ANATOMY:  163 | TT | BBBB | N
-//   163   — Decobella supplier constant (always)
-//   TT    — 2-digit type code from UPCBodyClass link on PM record
-//   BBBB  — derived from supplier SKU:
-//             Old-style (e.g. 0573-BGE) → extract first 4 digits
-//             New-style (e.g. EQP-COCO515-GLS-BLK) → group by
-//             range+finish, allocate next sequential after MAX(BBBB)
-//   N     — colour sequence within BBBB group (from UPCColourMaster
-//             link order). 1-digit for ≤9 colours, 2-digit for ≥10.
-//
-// TRIGGER:
-//   PM.Product_Status = "NEW PRODUCTS"
-//
-// ENRICHMENT GATE (all four required before PLU can be proposed):
-//   ✅ UPCBodyClass link     → provides TT
-//   ✅ Size Length MM        → confirms BBBB basis
-//   ✅ Size Width MM         → confirms BBBB basis
-//   ✅ UPCColourMaster link  → provides N
-//
-// OUTPUT:
-//   Anomalies record per proposed PLU:
-//     Anomaly Type  = "PLU_Ready"
-//     Detected Value = proposed PLU string
-//     Notes          = "Proposed new PLU for [Name]: [PLU].
-//                       Awaiting manual operator entry into ProductMaster."
-//
-// NINA'S WORKFLOW AFTER THIS SCRIPT:
-//   1. Open Anomalies table, filter by Anomaly Type = PLU_Ready
-//   2. Review each proposed PLU
-//   3. If correct: manually type PLU into PM.Product_SKU_Master
-//                  set Anomaly Resolution = Resolved
-//   4. If wrong: add a note and set Resolution = Under_Review
-// =============================================================
+/**
+ * SCRIPT 3 — PLU GENERATOR v3.2 (Production Ready)
+ * 
+ * PURPOSE:
+ *   Proposes internal PLU codes (163|TT|BBBB|N) for NEW PRODUCTS records
+ *   that have complete enrichment data (body type, size, colour).
+ * 
+ * ARCHITECTURE:
+ *   1. Reverse-lookup body type in UPCBodyClass → extract TT code
+ *   2. Resolve BBBB from supplier SKU (old-style or new-style)
+ *   3. Sequence N within BBBB group
+ *   4. Propose to Anomalies for manual verification
+ * 
+ * TRIGGER: ProductMaster records with Status = "PM NEW" and no PLU
+ * 
+ * OUTPUT: Creates "PLU_Ready" Anomalies with proposed PLU
+ */
 
-// =============================================================
-// TABLE IDs  — confirm UPC table IDs against your Airtable base
-// =============================================================
+// ============================================================
+// TABLE IDs
+// ============================================================
 const PM_TABLE_ID = "tblgLqMMXX2HcKt9U";
 const SPD_TABLE_ID = "tbl7mZpHJCUs1r0cg";
-const UPC_BODY_CLASS_TBL_ID = "tblTKGGHdw9pUD0yR"; // ← replace with real ID
+const UPC_BODY_CLASS_TBL_ID = "tblTKGGHdw9pUD0yR";
 const ANOMALIES_TABLE_ID = "tbl56i9Rlm2mK6t1w";
-const ADMIN_LOGS_TABLE_ID = "tblk1v5VHPEC2c2u2";
 
-// =============================================================
-// PM FIELD IDs
-// =============================================================
-const PM_SKU_MASTER_FID = "fldMfK3uyPnDbKONn"; // Product SKU Master (PLU — do not write)
-const PM_NAME_FID = "fld7hdhxyu61r5Olm"; // FIX: was fldVN8HH5cJX2SBVH (not in schema) — correct field is Product Description
-const PM_STATUS_FID = "flddq6S7409EBM71D"; // Product_Status
-const PM_SPD_LINK_FID = "fldxZcpnCCCYW5zHx"; // FIX: was fldGxaIlPVor7QEwN (SPD→PM direction, wrong side) — PM→SPD link
-const PM_UBC_LINK_FID = "fldyrCQE5L3lQktS3"; // FIX: was fldzBkUc1dqtsRbvj (not in schema) — correct PM→UPCBodyClass link
-const PM_COLOUR_LINK_FID = "fldDBJifgrvsMqR9g"; // UPCColourMaster link
-const PM_SIZE_LENGTH_FID = "fld0UAx6ANs6ukXmE"; // FIX: fldQns7cT9JDqHy0Z is SPD's size field; PM has multipleLookupValues Size Length MM → fld0UAx6ANs6ukXmE
-const PM_SIZE_WIDTH_FID = "flddQpgGUlSOJlfBk"; // FIX: same — PM's Size Width MM lookup → flddQpgGUlSOJlfBk
+// ============================================================
+// FIELD IDs — ProductMaster
+// ============================================================
+const PM_SKU_MASTER_FID = "fldMfK3uyPnDbKONn"; // ✅ Product SKU Master (PLU)
+const PM_NAME_FID = "?"; // TODO: Replace with actual Product Name/Description field ID
+const PM_STATUS_FID = "flddq6S7409EBM71D"; // ✅ Status (PM NEW, PM ACTIVE, etc.)
+const PM_SPD_LINK_FID = "fldxZcpnCCCYW5zHx"; // ✅ Link to SupplierProductData
+const PM_UBC_LINK_FID = "fldyrCQE5L3lQktS3"; // ✅ Link to UPCBodyClass
+const PM_COLOUR_LINK_FID = "fldDBJifgrvsMqR9g"; // ✅ Link to UPCColourMaster
+const PM_SIZE_LENGTH_FID = "fld0UAx6ANs6ukXmE"; // ✅ Size Length MM (lookup)
+const PM_SIZE_WIDTH_FID = "flddQpgGUlSOJlfBk"; // ✅ Size Width MM (lookup)
+const PM_TT_EXTRACTOR_FID = "fldqGQUzzlMkHcx0N"; // Formula: VALUE(MID({SKU}, 4, 2))
 
-// =============================================================
-// UPCBodyClass FIELD IDs
-// =============================================================
-const UBC_CATEGORY_NO_FID = "flddbKj9I5DhNRLsx"; // Category No (e.g. "01", "04")
-const UBC_PROD_CATEGORY_FID = "fldVS7MdpvEAx7jkK";
+// ============================================================
+// FIELD IDs — UPCBodyClass
+// ============================================================
+const UBC_PRODUCT_TYPE_FID = "flddbKj9I5DhNRLsx"; // ✅ Product Type (Ceramic, Porcelain, etc.)
+const UBC_CATEGORY_NO_FID = "fldA2oxWnAijIjrpT"; // ✅ Category No ("01", "02", "03", "04")
 
-// =============================================================
-// SPD FIELD IDs (needed to read supplier SKU for BBBB logic)
-// =============================================================
-const SPD_SKU_FID = "fldK3FyPA98F3smc9"; // Supplier SKU
+// ============================================================
+// FIELD IDs — SPD (SupplierProductData)
+// ============================================================
+const SPD_SKU_FID = "fldK3FyPA98F3smc9"; // ✅ Supplier SKU
+const SPD_BODY_TYPE_FID = "fldtMpYo9uqtirVW7"; // Body Type (Porcelain, Ceramic) — if standardized
 
-// =============================================================
-// Anomalies FIELD IDs
-// =============================================================
-const ANOM_ERROR_TYPE_FID = "fldjYiDzJmdYJp6uF"; // Error Type (singleSelect)
-const ANOM_DETECTED_VAL_FID = "fld0wlmRbNFgVpbXS"; // Original Value / Detected Value
+// ============================================================
+// FIELD IDs — Anomalies
+// ============================================================
+const ANOM_ERROR_TYPE_FID = "fldjYiDzJmdYJp6uF"; // Error Type
+const ANOM_DETECTED_VAL_FID = "fld0wlmRbNFgVpbXS"; // Detected Value (the PLU)
 const ANOM_NOTES_FID = "fldB7o9RtnQPi4goY"; // Notes
-const ANOM_SEVERITY_FID = "fld3TPgysD2hLbtvR"; // Error Severity
+const ANOM_SEVERITY_FID = "fld3TPgysD2hLbtvR"; // Severity
 const ANOM_DETECTED_BY_FID = "fldbPrkOy6XavA4ef"; // Detected By
 const ANOM_RESOLUTION_FID = "fld4li4vcLn43h2N4"; // Resolution Status
 const ANOM_DATE_FID = "fldE7JCdKubLvxysd"; // Date Detected
 
-// PLU constant
+// ============================================================
+// CONSTANTS
+// ============================================================
 const SUPPLIER_CODE = "163";
+const PM_STATUS_TRIGGER = "PM NEW"; // Exact status value to filter on
+const RESOLUTION_UNRESOLVED = "Unresolved"; // Valid: Unresolved, In Progress, Resolved, etc.
 
-// =============================================================
-// HELPERS
-// =============================================================
+// ============================================================
+// DIRTY DATA NORMALIZATION
+// ============================================================
+
+/**
+ * Normalize messy body type strings to match UPCBodyClass entries.
+ * Handles: spaces, case, line breaks, variations like "Red Ceramic" → "Ceramic"
+ */
+const BODY_TYPE_NORMALIZER = {
+  // Ceramic variants (all → "Ceramic")
+  "ceramic": "Ceramic",
+  "ceramicred": "Ceramic",
+  "ceramicwhite": "Ceramic",
+  "ceramicredhardword": "Ceramic",
+  "hardceramic": "Ceramic",
+  "ceramic white": "Ceramic",
+  "ceramic red": "Ceramic",
+  "white ceramic": "Ceramic",
+  "red ceramic": "Ceramic",
+
+  // Porcelain variants (all → "Porcelain")
+  "porcelain": "Porcelain",
+  "porcelainglazed": "Porcelain",
+  "glazedporcelain": "Porcelain",
+  "porcelainfullword": "Porcelain",
+  "fullwordporcelain": "Porcelain",
+  "colourwordporcelain": "Porcelain",
+  "colorwordporcelain": "Porcelain",
+  "porcelain glazed": "Porcelain",
+  "glazed porcelain": "Porcelain",
+  "porcelain full body": "Porcelain",
+  "colour porcelain": "Porcelain",
+  "color porcelain": "Porcelain",
+
+  // Gris Porcelain (special type 03)
+  "grisporcelain": "Gris Porcelain",
+  "gris porcelain": "Gris Porcelain",
+  "greyporcelain": "Gris Porcelain",
+  "grey porcelain": "Gris Porcelain",
+
+  // Hard Body Ceramic (special type 02)
+  "hardbodyceramic": "Hard body Ceramic",
+  "hard body ceramic": "Hard body Ceramic",
+};
+
+function normalizeBodyType(rawBodyType) {
+  if (!rawBodyType) return null;
+
+  // Clean: lowercase, remove spaces/newlines, remove special chars
+  const cleaned = rawBodyType
+    .toLowerCase()
+    .replace(/[\s\n\r]+/g, "") // Remove all whitespace
+    .replace(/[^a-z0-9]/g, ""); // Remove special characters
+
+  // Exact match in normalizer
+  if (BODY_TYPE_NORMALIZER[cleaned]) {
+    return BODY_TYPE_NORMALIZER[cleaned];
+  }
+
+  // Partial/fuzzy match: check if cleaned contains key substrings
+  for (const [key, canonical] of Object.entries(BODY_TYPE_NORMALIZER)) {
+    if (cleaned.includes(key)) {
+      return canonical;
+    }
+  }
+
+  return null; // Unable to normalize
+}
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
 
 function zeroPad(n, width) {
   return String(n).padStart(width, "0");
 }
 
-// Old-style Decobella SKU: NNNN-XXX  e.g. "0573-BGE"
 function isOldStyleSku(sku) {
   return /^\d{4}-[A-Z0-9./]+$/i.test(sku.trim());
 }
 
-// Extract BBBB from old-style SKU
 function extractBBBB(sku) {
   return sku.trim().substring(0, 4);
 }
 
-// New-style SKU group key: everything except the colour suffix
-// EQP-COCO515-GLS-BLK  →  COCO515-GLS
-// EQP-MNC1010-BSLGN    →  MNC1010  (single segment after EQP)
 function extractNewStyleGroupKey(sku) {
   const parts = sku.trim().toUpperCase().split("-");
   const filtered = parts[0] === "EQP" ? parts.slice(1) : parts;
@@ -117,413 +159,416 @@ function extractNewStyleGroupKey(sku) {
   return filtered.slice(0, -1).join("-");
 }
 
-// Parse TT + BBBB + N from an existing PLU string
-// 163 + TT(2) + BBBB(4) + N(1-2)
-function parsePlu(plu) {
-  const s = String(plu).trim();
-  if (!s.startsWith("163") || s.length < 10) return null;
-  const tt = s.substring(3, 5);
-  const bbbb = s.substring(5, 9);
-  const n = parseInt(s.substring(9), 10) || 0;
-  return { tt, bbbb, n };
+function chunk(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
 }
 
-// =============================================================
+// ============================================================
 // MAIN
-// =============================================================
+// ============================================================
+
 async function main() {
-  output.markdown("# 🏷️ Script 3 — PLU Generator v2.0 (Proposal Engine)");
-  output.markdown(`> Running at: \`${new Date().toLocaleString()}\``);
-  output.markdown(
-    "> **Mode: Soft Create** — proposes PLUs to Anomalies. Does NOT write to ProductMaster.",
-  );
-  output.markdown("---");
+  output.markdown("# 🏷️ Script 3 — PLU Generator v3.2\n");
+  output.markdown(`> **Time:** ${new Date().toLocaleString()}\n`);
+  output.markdown("> **Mode:** Soft Proposal (writes to Anomalies only)\n");
+  output.markdown("---\n");
 
   const pmTable = base.getTable(PM_TABLE_ID);
   const spdTable = base.getTable(SPD_TABLE_ID);
   const ubcTable = base.getTable(UPC_BODY_CLASS_TBL_ID);
   const anomTable = base.getTable(ANOMALIES_TABLE_ID);
 
-  // ============================================================
-  // STEP 1 — Load UPCBodyClass lookup: record ID → TT
-  // ============================================================
-  output.markdown("## Step 1 — Loading UPCBodyClass lookup...");
+  try {
+    // ────────────────────────────────────────────────────────
+    // STEP 1 — Load UPCBodyClass & build reverse-lookup
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 1 — Loading UPCBodyClass...");
 
-  // AFTER — read directly from fldA2oxWnAijIjrpT, already padded:
-  const ubcQuery = await ubcTable.selectRecordsAsync({
-    fields: ["flddbKj9I5DhNRLsx", "fldA2oxWnAijIjrpT"],
-  });
-  const ubcIdToTT = new Map(
-    ubcQuery.records.map((r) => [
-      r.id,
-      r.getCellValueAsString("fldA2oxWnAijIjrpT"), // "04", "11" etc — already correct
-    ]),
-  );
+    const ubcQuery = await ubcTable.selectRecordsAsync({
+      fields: [UBC_PRODUCT_TYPE_FID, UBC_CATEGORY_NO_FID],
+    });
 
-  for (const r of ubcQuery.records) {
-    const no = r.getCellValueAsString(UBC_CATEGORY_NO_FID).trim();
-    const cat = r
-      .getCellValueAsString(UBC_PROD_CATEGORY_FID)
-      .trim()
-      .toLowerCase();
-    if (no) {
-      const tt = zeroPad(parseInt(no, 10), 2);
-      ubcIdToTT.set(r.id, tt);
-      if (cat) ubcNameToTT.set(cat, tt);
-    }
-  }
+    // Map: Canonical Product Type → TT Code
+    const bodyTypeToTT = new Map();
 
-  output.markdown(`✅ Loaded **${ubcIdToTT.size}** body class entries.`);
+    for (const r of ubcQuery.records) {
+      const productType = r.getCellValueAsString(UBC_PRODUCT_TYPE_FID).trim();
+      const categoryNo = r.getCellValueAsString(UBC_CATEGORY_NO_FID).trim();
 
-  // ============================================================
-  // STEP 2 — Build BBBB index from existing PM PLUs
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## Step 2 — Indexing existing PLUs from ProductMaster...");
-
-  const pmAllQuery = await pmTable.selectRecordsAsync({
-    fields: [PM_SKU_MASTER_FID, PM_STATUS_FID, PM_SPD_LINK_FID],
-  });
-
-  // bbbbIndex[tt][bbbb] = maxN  (highest N assigned in this group)
-  const bbbbIndex = {};
-  const maxBbbbPerTt = {}; // tt → highest BBBB integer seen
-  const newStyleGroupMap = {}; // "tt|groupKey" → bbbb already assigned
-
-  for (const r of pmAllQuery.records) {
-    const plu = r.getCellValueAsString(PM_SKU_MASTER_FID).trim();
-    if (!plu.startsWith("163") || plu.length < 10) continue;
-
-    const parsed = parsePlu(plu);
-    if (!parsed) continue;
-
-    const { tt, bbbb, n } = parsed;
-
-    if (!bbbbIndex[tt]) bbbbIndex[tt] = {};
-    if (!bbbbIndex[tt][bbbb]) bbbbIndex[tt][bbbb] = 0;
-    if (n > bbbbIndex[tt][bbbb]) bbbbIndex[tt][bbbb] = n;
-
-    const bbbbInt = parseInt(bbbb, 10);
-    if (!maxBbbbPerTt[tt] || bbbbInt > maxBbbbPerTt[tt]) {
-      maxBbbbPerTt[tt] = bbbbInt;
-    }
-  }
-
-  // Also check Anomalies for PLU_Ready proposals already logged
-  // (prevents duplicate proposals on repeated runs)
-  const anomQuery = await anomTable.selectRecordsAsync({
-    fields: [ANOM_ERROR_TYPE_FID, ANOM_DETECTED_VAL_FID, ANOM_RESOLUTION_FID],
-  });
-
-  const alreadyProposed = new Set();
-  for (const r of anomQuery.records) {
-    const type = r.getCellValueAsString(ANOM_ERROR_TYPE_FID);
-    const resolution = r.getCellValueAsString(ANOM_RESOLUTION_FID);
-    const detVal = r.getCellValueAsString(ANOM_DETECTED_VAL_FID).trim();
-    // Track open (unresolved) PLU proposals so we don't duplicate
-    if (type === "PLU_Ready" && resolution !== "Resolved" && detVal) {
-      alreadyProposed.add(detVal);
-    }
-  }
-
-  output.markdown(
-    `✅ Indexed **${pmAllQuery.records.length}** PM records | **${alreadyProposed.size}** open proposals already in Anomalies.`,
-  );
-
-  // Working copies for this run's allocations
-  const wBbbbIndex = JSON.parse(JSON.stringify(bbbbIndex));
-  const wMaxBbbb = { ...maxBbbbPerTt };
-  const wNewStyleMap = { ...newStyleGroupMap };
-
-  // ============================================================
-  // STEP 3 — Load PM records with Status = "NEW PRODUCTS"
-  // ============================================================
-  output.markdown("---");
-  output.markdown(
-    "## Step 3 — Loading NEW PRODUCTS records from ProductMaster...",
-  );
-
-  const newPmQuery = await pmTable.selectRecordsAsync({
-    fields: [
-      PM_SKU_MASTER_FID,
-      PM_NAME_FID,
-      PM_STATUS_FID,
-      PM_SPD_LINK_FID,
-      PM_UBC_LINK_FID,
-      PM_COLOUR_LINK_FID,
-      PM_SIZE_LENGTH_FID,
-      PM_SIZE_WIDTH_FID,
-    ],
-  });
-
-  const newProducts = newPmQuery.records.filter((r) => {
-    const status = r.getCellValueAsString(PM_STATUS_FID).trim();
-    // Only process records with no PLU yet
-    const hasPlu = r.getCellValueAsString(PM_SKU_MASTER_FID).trim() !== "";
-    return status === "NEW PRODUCTS" && !hasPlu;
-  });
-
-  output.markdown(
-    `✅ Found **${newProducts.length}** NEW PRODUCTS records without a PLU.`,
-  );
-
-  if (newProducts.length === 0) {
-    output.markdown(
-      "✅ Nothing to propose. All NEW PRODUCTS records already have PLUs.",
-    );
-    return;
-  }
-
-  // ============================================================
-  // STEP 4 — Enrichment gate + PLU assembly
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## Step 4 — Validating enrichment and assembling PLUs...");
-
-  // Load SPD records to get supplier SKU (needed for BBBB logic)
-  const spdQuery = await spdTable.selectRecordsAsync({
-    fields: [SPD_SKU_FID],
-  });
-  const spdById = new Map(spdQuery.records.map((r) => [r.id, r]));
-
-  const proposals = [];
-  const gated = []; // failed enrichment gate
-  const duplicates = []; // already proposed and open
-
-  for (const pmRec of newProducts) {
-    const name = pmRec.getCellValueAsString(PM_NAME_FID).trim() || pmRec.id;
-
-    // ── Enrichment gate ──────────────────────────────────────
-    const ubcLinks = pmRec.getCellValue(PM_UBC_LINK_FID) || [];
-    const colourLinks = pmRec.getCellValue(PM_COLOUR_LINK_FID) || [];
-    const sizeLenVal = pmRec.getCellValue(PM_SIZE_LENGTH_FID);
-    const sizeWidVal = pmRec.getCellValue(PM_SIZE_WIDTH_FID);
-
-    const missing = [];
-    if (!ubcLinks.length) missing.push("UPCBodyClass");
-    // FIX: PM Size Length/Width are multipleLookupValues — getCellValue returns array, not a number.
-    // Check array length > 0 and first element is truthy/non-zero.
-    const sizeLenArr = Array.isArray(sizeLenVal)
-      ? sizeLenVal
-      : sizeLenVal
-        ? [sizeLenVal]
-        : [];
-    const sizeWidArr = Array.isArray(sizeWidVal)
-      ? sizeWidVal
-      : sizeWidVal
-        ? [sizeWidVal]
-        : [];
-    if (!sizeLenArr.length || !sizeLenArr[0]) missing.push("Size Length MM");
-    if (!sizeWidArr.length || !sizeWidArr[0]) missing.push("Size Width MM");
-    if (!colourLinks.length) missing.push("UPCColourMaster");
-
-    if (missing.length > 0) {
-      gated.push({ name, missing: missing.join(", ") });
-      continue;
-    }
-
-    // ── Resolve TT from UPCBodyClass link ───────────────────
-    const ubcRecId = ubcLinks[0].id;
-    const tt = ubcIdToTT.get(ubcRecId) || null;
-
-    if (!tt) {
-      gated.push({
-        name,
-        missing: `UPCBodyClass record ID ${ubcRecId} has no Category No — check UPCBodyClass table.`,
-      });
-      continue;
-    }
-
-    // ── Resolve BBBB from SPD supplier SKU ──────────────────
-    const spdLinks = pmRec.getCellValue(PM_SPD_LINK_FID) || [];
-    let rawSku = "";
-    if (spdLinks.length > 0) {
-      const spdRec = spdById.get(spdLinks[0].id);
-      if (spdRec) rawSku = spdRec.getCellValueAsString(SPD_SKU_FID).trim();
-    }
-
-    let bbbb;
-    let bbbbSource;
-
-    if (rawSku && isOldStyleSku(rawSku)) {
-      // Old-style: extract BBBB from supplier SKU directly
-      bbbb = extractBBBB(rawSku);
-      bbbbSource = `extracted from supplier SKU "${rawSku}"`;
-    } else if (rawSku) {
-      // New-style EQP- SKU: group by range+finish
-      const groupKey = extractNewStyleGroupKey(rawSku);
-      const indexKey = `${tt}|${groupKey}`;
-
-      if (wNewStyleMap[indexKey]) {
-        bbbb = wNewStyleMap[indexKey];
-        bbbbSource = `reused BBBB for group "${groupKey}"`;
-      } else {
-        const currentMax = wMaxBbbb[tt] || 0;
-        const nextBbbbInt = currentMax + 1;
-        bbbb = zeroPad(nextBbbbInt, 4);
-        wMaxBbbb[tt] = nextBbbbInt;
-        wNewStyleMap[indexKey] = bbbb;
-        bbbbSource = `new sequential BBBB ${bbbb} for group "${groupKey}"`;
+      if (productType && categoryNo) {
+        const tt = zeroPad(parseInt(categoryNo, 10), 2);
+        bodyTypeToTT.set(productType, tt);
       }
-    } else {
-      // No SPD link or no SKU — fall back to pure sequential
-      const currentMax = wMaxBbbb[tt] || 0;
-      const nextBbbbInt = currentMax + 1;
-      bbbb = zeroPad(nextBbbbInt, 4);
-      wMaxBbbb[tt] = nextBbbbInt;
-      bbbbSource = `sequential (no supplier SKU found)`;
     }
 
-    // ── Resolve N from colour position ──────────────────────
-    if (!wBbbbIndex[tt]) wBbbbIndex[tt] = {};
-    if (!wBbbbIndex[tt][bbbb]) wBbbbIndex[tt][bbbb] = 0;
+    output.markdown(`✅ Loaded ${bodyTypeToTT.size} body type mappings.\n`);
 
-    const nextN = wBbbbIndex[tt][bbbb] + 1;
-    wBbbbIndex[tt][bbbb] = nextN;
-
-    // ── Assemble PLU ─────────────────────────────────────────
-    const nStr = String(nextN); // 1-digit ≤9, 2-digit ≥10
-    const plu = `${SUPPLIER_CODE}${tt}${bbbb}${nStr}`;
-
-    // ── Duplicate check ──────────────────────────────────────
-    if (alreadyProposed.has(plu)) {
-      duplicates.push({ name, plu });
-      continue;
-    }
-
-    proposals.push({
-      pmRec,
-      name,
-      plu,
-      tt,
-      bbbb,
-      n: nextN,
-      bbbbSource,
-      rawSku,
-    });
-  }
-
-  // ============================================================
-  // STEP 5 — Preview
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## Step 5 — Preview (no writes yet)");
-  output.markdown(
-    `**${proposals.length}** PLUs ready to propose | ` +
-      `**${gated.length}** blocked (enrichment incomplete) | ` +
-      `**${duplicates.length}** skipped (already proposed)`,
-  );
-
-  if (proposals.length > 0) {
-    output.markdown(
-      "\n| # | Product Name | Supplier SKU | TT | BBBB | N | **Proposed PLU** |",
-    );
-    output.markdown("|---|---|---|---|---|---|---|");
-    proposals.forEach((p, i) => {
+    if (bodyTypeToTT.size === 0) {
       output.markdown(
-        `| ${i + 1} | ${p.name} | \`${p.rawSku || "—"}\` | ${p.tt} | ${p.bbbb} | ${p.n} | **\`${p.plu}\`** |`,
+        "❌ **Error:** No body type mappings found in UPCBodyClass. Cannot proceed."
       );
-    });
-  }
+      return;
+    }
 
-  if (gated.length > 0) {
-    output.markdown("\n### ⛔ Blocked — enrichment incomplete");
-    output.markdown("| Product Name | Missing fields |");
-    output.markdown("|---|---|");
-    gated.forEach((g) => output.markdown(`| ${g.name} | ${g.missing} |`));
+    // ────────────────────────────────────────────────────────
+    // STEP 2 — Index existing PLUs
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 2 — Indexing existing PLUs...");
+
+    const pmAllQuery = await pmTable.selectRecordsAsync({
+      fields: [PM_SKU_MASTER_FID],
+    });
+
+    const bbbbIndex = {}, maxBbbbPerTt = {};
+
+    for (const r of pmAllQuery.records) {
+      const plu = r.getCellValueAsString(PM_SKU_MASTER_FID).trim();
+      if (!plu.startsWith("163") || plu.length < 10) continue;
+
+      const tt = plu.substring(3, 5);
+      const bbbb = plu.substring(5, 9);
+      const n = parseInt(plu.substring(9), 10) || 0;
+
+      if (!bbbbIndex[tt]) bbbbIndex[tt] = {};
+      if (!bbbbIndex[tt][bbbb]) bbbbIndex[tt][bbbb] = 0;
+      if (n > bbbbIndex[tt][bbbb]) bbbbIndex[tt][bbbb] = n;
+
+      const bbbbInt = parseInt(bbbb, 10);
+      if (!maxBbbbPerTt[tt] || bbbbInt > maxBbbbPerTt[tt]) {
+        maxBbbbPerTt[tt] = bbbbInt;
+      }
+    }
+
+    // Check for already-proposed PLUs in Anomalies
+    const anomQuery = await anomTable.selectRecordsAsync({
+      fields: [ANOM_ERROR_TYPE_FID, ANOM_DETECTED_VAL_FID, ANOM_RESOLUTION_FID],
+    });
+
+    const alreadyProposed = new Set();
+    for (const r of anomQuery.records) {
+      const type = r.getCellValueAsString(ANOM_ERROR_TYPE_FID);
+      const resolution = r.getCellValueAsString(ANOM_RESOLUTION_FID);
+      const detVal = r.getCellValueAsString(ANOM_DETECTED_VAL_FID).trim();
+      if (type === "PLU_Ready" && resolution !== "Resolved" && detVal) {
+        alreadyProposed.add(detVal);
+      }
+    }
+
     output.markdown(
-      "\n> Complete the missing fields on these PM records and re-run Script 3.",
+      `✅ Indexed ${pmAllQuery.records.length} PM records | ${alreadyProposed.size} open proposals.\n`
+    );
+
+    const wBbbbIndex = JSON.parse(JSON.stringify(bbbbIndex));
+    const wMaxBbbb = { ...maxBbbbPerTt };
+    const wNewStyleMap = {};
+
+    // ────────────────────────────────────────────────────────
+    // STEP 3 — Load NEW PRODUCTS records
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 3 — Loading NEW PRODUCTS records...");
+
+    const newPmQuery = await pmTable.selectRecordsAsync({
+      fields: [
+        PM_SKU_MASTER_FID,
+        PM_NAME_FID,
+        PM_STATUS_FID,
+        PM_SPD_LINK_FID,
+        PM_UBC_LINK_FID,
+        PM_COLOUR_LINK_FID,
+        PM_SIZE_LENGTH_FID,
+        PM_SIZE_WIDTH_FID,
+      ],
+    });
+
+    const newProducts = newPmQuery.records.filter((r) => {
+      const status = r.getCellValueAsString(PM_STATUS_FID).trim();
+      const hasPlu = r.getCellValueAsString(PM_SKU_MASTER_FID).trim() !== "";
+      return status === PM_STATUS_TRIGGER && !hasPlu;
+    });
+
+    output.markdown(`✅ Found ${newProducts.length} records without PLU.\n`);
+
+    if (newProducts.length === 0) {
+      output.markdown("✅ All NEW PRODUCTS have PLUs. Nothing to propose.");
+      return;
+    }
+
+    // ────────────────────────────────────────────────────────
+    // STEP 4 — Load SPD and process enrichment
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 4 — Validating enrichment...\n");
+
+    const spdQuery = await spdTable.selectRecordsAsync({
+      fields: [SPD_SKU_FID, SPD_BODY_TYPE_FID],
+    });
+    const spdById = new Map(spdQuery.records.map((r) => [r.id, r]));
+
+    const proposals = [], gated = [], duplicates = [];
+
+    for (const pmRec of newProducts) {
+      const name = pmRec.getCellValueAsString(PM_NAME_FID).trim() || pmRec.id;
+
+      // ── Enrichment gate ─────────────────────────────────────
+      const ubcLinks = pmRec.getCellValue(PM_UBC_LINK_FID) || [];
+      const colourLinks = pmRec.getCellValue(PM_COLOUR_LINK_FID) || [];
+      const sizeLenVal = pmRec.getCellValue(PM_SIZE_LENGTH_FID) || [];
+      const sizeWidVal = pmRec.getCellValue(PM_SIZE_WIDTH_FID) || [];
+
+      const sizeLenArr = Array.isArray(sizeLenVal)
+        ? sizeLenVal
+        : sizeLenVal
+          ? [sizeLenVal]
+          : [];
+      const sizeWidArr = Array.isArray(sizeWidVal)
+        ? sizeWidVal
+        : sizeWidVal
+          ? [sizeWidVal]
+          : [];
+
+      const missing = [];
+      if (!ubcLinks.length) missing.push("UPCBodyClass link");
+      if (!sizeLenArr.length || !sizeLenArr[0]) missing.push("Size Length MM");
+      if (!sizeWidArr.length || !sizeWidArr[0]) missing.push("Size Width MM");
+      if (!colourLinks.length) missing.push("UPCColourMaster link");
+
+      if (missing.length > 0) {
+        gated.push({ name, missing: missing.join(", ") });
+        continue;
+      }
+
+      // ── Resolve TT from UPCBodyClass link ───────────────────
+      const ubcRecId = ubcLinks[0].id;
+      const ubcRec = ubcQuery.records.find((r) => r.id === ubcRecId);
+
+      if (!ubcRec) {
+        gated.push({
+          name,
+          missing: `UPCBodyClass record ${ubcRecId} not found in index`,
+        });
+        continue;
+      }
+
+      const bodyTypeName = ubcRec
+        .getCellValueAsString(UBC_PRODUCT_TYPE_FID)
+        .trim();
+      const tt = bodyTypeToTT.get(bodyTypeName);
+
+      if (!tt) {
+        gated.push({
+          name,
+          missing: `Body Type "${bodyTypeName}" has no TT code in UPCBodyClass`,
+        });
+        continue;
+      }
+
+      // ── Resolve BBBB from SPD supplier SKU ──────────────────
+      const spdLinks = pmRec.getCellValue(PM_SPD_LINK_FID) || [];
+      let rawSku = "";
+
+      if (spdLinks.length > 0) {
+        const spdRec = spdById.get(spdLinks[0].id);
+        if (spdRec) {
+          rawSku = spdRec.getCellValueAsString(SPD_SKU_FID).trim();
+        }
+      }
+
+      let bbbb, bbbbSource;
+
+      if (rawSku && isOldStyleSku(rawSku)) {
+        bbbb = extractBBBB(rawSku);
+        bbbbSource = `from supplier SKU "${rawSku}"`;
+      } else if (rawSku) {
+        const groupKey = extractNewStyleGroupKey(rawSku);
+        const indexKey = `${tt}|${groupKey}`;
+
+        if (wNewStyleMap[indexKey]) {
+          bbbb = wNewStyleMap[indexKey];
+          bbbbSource = `reused for group "${groupKey}"`;
+        } else {
+          const nextInt = (wMaxBbbb[tt] || 0) + 1;
+          bbbb = zeroPad(nextInt, 4);
+          wMaxBbbb[tt] = nextInt;
+          wNewStyleMap[indexKey] = bbbb;
+          bbbbSource = `new sequential (${bbbb}) for group "${groupKey}"`;
+        }
+      } else {
+        const nextInt = (wMaxBbbb[tt] || 0) + 1;
+        bbbb = zeroPad(nextInt, 4);
+        wMaxBbbb[tt] = nextInt;
+        bbbbSource = `sequential (${bbbb}, no supplier SKU)`;
+      }
+
+      // ── Resolve N (colour sequence) ─────────────────────────
+      if (!wBbbbIndex[tt]) wBbbbIndex[tt] = {};
+      if (!wBbbbIndex[tt][bbbb]) wBbbbIndex[tt][bbbb] = 0;
+
+      const nextN = wBbbbIndex[tt][bbbb] + 1;
+      wBbbbIndex[tt][bbbb] = nextN;
+
+      // ── Assemble PLU ────────────────────────────────────────
+      const plu = `${SUPPLIER_CODE}${tt}${bbbb}${nextN}`;
+
+      if (alreadyProposed.has(plu)) {
+        duplicates.push({ name, plu });
+        continue;
+      }
+
+      proposals.push({
+        pmRec,
+        name,
+        plu,
+        tt,
+        bbbb,
+        n: nextN,
+        bbbbSource,
+        rawSku,
+        bodyType: bodyTypeName,
+      });
+    }
+
+    // ────────────────────────────────────────────────────────
+    // STEP 5 — Preview
+    // ────────────────────────────────────────────────────────
+    output.markdown("---\n## Step 5 — Preview\n");
+    output.markdown(
+      `**${proposals.length}** ready | **${gated.length}** blocked | **${duplicates.length}** duplicate\n`
+    );
+
+    if (proposals.length > 0) {
+      output.markdown(
+        "|#|Product|Body Type|TT|BBBB|N|PLU|\n|---|---|---|---|---|---|---|\n"
+      );
+      proposals.forEach((p, i) => {
+        output.markdown(
+          `|${i + 1}|${p.name}|${p.bodyType}|${p.tt}|${p.bbbb}|${p.n}|\`${p.plu}\`|\n`
+        );
+      });
+    }
+
+    if (gated.length > 0) {
+      output.markdown("\n### ⛔ Blocked (enrichment incomplete)\n");
+      gated.forEach((g) => output.markdown(`- **${g.name}**: ${g.missing}\n`));
+    }
+
+    if (duplicates.length > 0) {
+      output.markdown("\n### ℹ️ Skipped (already proposed)\n");
+      duplicates.forEach((d) =>
+        output.markdown(`- \`${d.plu}\` — ${d.name}\n`)
+      );
+    }
+
+    if (proposals.length === 0) {
+      output.markdown("\nNo PLUs to propose.");
+      return;
+    }
+
+    // ────────────────────────────────────────────────────────
+    // STEP 6 — Confirm
+    // ────────────────────────────────────────────────────────
+    output.markdown("---\n");
+    const confirm = await input.buttonsAsync(
+      `Propose ${proposals.length} PLU${proposals.length !== 1 ? "s" : ""} to Anomalies?`,
+      [
+        { label: "✅ Yes, proceed", variant: "primary" },
+        { label: "❌ Cancel", variant: "danger" },
+      ]
+    );
+
+    if (confirm !== "✅ Yes, proceed") {
+      output.markdown("❌ Cancelled. No records changed.");
+      return;
+    }
+
+    // ────────────────────────────────────────────────────────
+    // STEP 7 — Write proposals to Anomalies
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 6 — Writing proposals...\n");
+
+    const today = new Date().toISOString().split("T")[0];
+
+    const anomCreates = proposals.map((p) => ({
+      fields: {
+        [ANOM_ERROR_TYPE_FID]: { name: "PLU_Ready" },
+        [ANOM_DETECTED_VAL_FID]: p.plu,
+        [ANOM_NOTES_FID]:
+          `**Proposed PLU:** \`${p.plu}\`\n\n` +
+          `**Product:** ${p.name}\n` +
+          `**Body Type:** ${p.bodyType} (TT = ${p.tt})\n` +
+          `**Supplier SKU:** ${p.rawSku || "—"}\n\n` +
+          `**Assembly Breakdown:**\n` +
+          `• **163** = Decobella supplier constant\n` +
+          `• **${p.tt}** = Type code (${p.bodyType})\n` +
+          `• **${p.bbbb}** = Base code (${p.bbbbSource})\n` +
+          `• **${p.n}** = Colour sequence in group\n\n` +
+          `**Action Required:** Verify the PLU logic is correct.\n` +
+          `✅ **If correct:** Copy PLU → open ProductMaster record → paste into **Product_SKU_Master** → return here → set **Resolution = Resolved**\n` +
+          `❌ **If incorrect:** Add notes explaining the issue → set **Resolution = Under_Review** → flag for review`,
+        [ANOM_SEVERITY_FID]: { name: "Info" },
+        [ANOM_DETECTED_BY_FID]: { name: "ETL_Script" },
+        [ANOM_RESOLUTION_FID]: { name: RESOLUTION_UNRESOLVED },
+        [ANOM_DATE_FID]: today,
+      },
+    }));
+
+    let written = 0;
+    for (const batch of chunk(anomCreates, 50)) {
+      try {
+        await anomTable.createRecordsAsync(batch);
+        written += batch.length;
+        output.markdown(
+          `✅ Batch written (${written}/${anomCreates.length})\n`
+        );
+      } catch (err) {
+        output.markdown(`\n❌ **Batch Write Failed:** ${err.message}\n`);
+        throw err;
+      }
+    }
+
+    // ────────────────────────────────────────────────────────
+    // STEP 8 — Summary & Next Steps
+    // ────────────────────────────────────────────────────────
+    output.markdown("---\n## ✅ PLU Generator Complete\n");
+    output.markdown(
+      `|Metric|Count|\n` +
+      `|---|---|\n` +
+      `|Proposals logged to Anomalies|${written}|\n` +
+      `|Blocked (enrichment incomplete)|${gated.length}|\n` +
+      `|Skipped (already proposed)|${duplicates.length}|\n`
+    );
+
+    output.markdown(
+      `\n### 📋 Nina's Workflow — Resolve Proposed PLUs\n\n` +
+      `**Filter Anomalies:**\n` +
+      `1. Open **Anomalies** table\n` +
+      `2. Apply filter: \`Anomaly Type = PLU_Ready\` AND \`Resolution Status = ${RESOLUTION_UNRESOLVED}\`\n\n` +
+      `**Review Each PLU:**\n` +
+      `3. Click an anomaly record\n` +
+      `4. Review the assembly breakdown (TT, BBBB, N logic)\n` +
+      `5. Check against Product Name and Supplier SKU\n\n` +
+      `**Resolve (If Correct):**\n` +
+      `6. Copy the proposed PLU\n` +
+      `7. Open the linked ProductMaster record\n` +
+      `8. Paste PLU into \`Product_SKU_Master\` field\n` +
+      `9. Return to Anomalies → set \`Resolution Status = Resolved\`\n\n` +
+      `**Flag (If Incorrect):**\n` +
+      `10. Add a note explaining the issue\n` +
+      `11. Set \`Resolution Status = Under_Review\`\n` +
+      `12. Escalate to team for investigation\n`
+    );
+  } catch (err) {
+    output.markdown(
+      `\n## ❌ Script Error\n\n` +
+      `**Message:** ${err.message}\n\n` +
+      `**Check:**\n` +
+      `- All field IDs are correct\n` +
+      `- ProductMaster records are linked to UPCBodyClass\n` +
+      `- Airtable connectivity is stable\n\n` +
+      `**Stack trace:**\n` +
+      `\`\`\`\n${err.stack}\n\`\`\``
     );
   }
-
-  if (duplicates.length > 0) {
-    output.markdown("\n### ℹ️ Already proposed (open in Anomalies)");
-    duplicates.forEach((d) => output.markdown(`- \`${d.plu}\` — ${d.name}`));
-  }
-
-  if (proposals.length === 0) {
-    output.markdown("\nNothing to write.");
-    return;
-  }
-
-  // ============================================================
-  // STEP 6 — Confirm
-  // ============================================================
-  output.markdown("---");
-  const confirm = await input.buttonsAsync(
-    `Log ${proposals.length} PLU proposals to Anomalies?`,
-    [
-      { label: "✅ Yes — log proposals", value: "yes", variant: "primary" },
-      { label: "❌ Cancel", value: "no", variant: "default" },
-    ],
-  );
-
-  if (confirm !== "yes") {
-    output.markdown("❌ Cancelled. No records changed.");
-    return;
-  }
-
-  // ============================================================
-  // STEP 7 — Write proposals to Anomalies
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## Step 6 — Writing proposals to Anomalies...");
-
-  const chunk = (arr, n) => {
-    const out = [];
-    for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-    return out;
-  };
-
-  const today = new Date().toISOString().split("T")[0];
-
-  const anomCreates = proposals.map((p) => ({
-    fields: {
-      [ANOM_ERROR_TYPE_FID]: { name: "PLU_Ready" },
-      [ANOM_DETECTED_VAL_FID]: p.plu,
-      [ANOM_NOTES_FID]:
-        `Proposed new PLU for "${p.name}": ${p.plu}.\n` +
-        `Awaiting manual operator entry into ProductMaster.\n\n` +
-        `Assembly breakdown:\n` +
-        `  163  = Decobella supplier constant\n` +
-        `  ${p.tt}   = TT (body class type code)\n` +
-        `  ${p.bbbb} = BBBB (${p.bbbbSource})\n` +
-        `  ${p.n}    = N (colour sequence in group)\n\n` +
-        `Supplier SKU: ${p.rawSku || "not linked"}\n` +
-        `PM Record ID: ${p.pmRec.id}`,
-      [ANOM_SEVERITY_FID]: { name: "Info" },
-      [ANOM_DETECTED_BY_FID]: { name: "ETL_Script" },
-      [ANOM_RESOLUTION_FID]: { name: "Open" },
-      [ANOM_DATE_FID]: today,
-    },
-  }));
-
-  for (const batch of chunk(anomCreates, 50)) {
-    await anomTable.createRecordsAsync(batch);
-  }
-
-  output.markdown(
-    `✅ Logged **${anomCreates.length}** PLU proposals to Anomalies.`,
-  );
-
-  // ============================================================
-  // STEP 8 — Summary
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## ✅ Run Complete");
-  output.markdown(
-    `| Metric | Count |\n|---|---|\n` +
-      `| PLU proposals logged to Anomalies | ${anomCreates.length} |\n` +
-      `| Blocked (enrichment incomplete)   | ${gated.length} |\n` +
-      `| Skipped (already proposed)        | ${duplicates.length} |`,
-  );
-  output.markdown(
-    "\n**Nina's next steps:**\n" +
-      "1. Open Anomalies table → filter by **Anomaly Type = PLU_Ready**\n" +
-      "2. Review each proposed PLU\n" +
-      "3. If correct → type PLU into **ProductMaster.Product_SKU_Master** → set Resolution = **Resolved**\n" +
-      "4. If wrong → add a note → set Resolution = **Under_Review**",
-  );
 }
 
 await main();

@@ -1,600 +1,419 @@
 /**
- *  SCRIPT 1 — ETL ROUTER v1.7 (Unified Production)
- *  Utile PIM | Revised: March 2026
- *  MANDATE:
- *  - Zero-Omission: Full production logic for Stock, Logistics, and Lifecycle.
- *  - MDM Firewall: Uses nullSafeNum to protect governed SPD fields.
- *  - EOR/DD Logic: Full stock write + lifecycle status on SPD Stock Status (fld1eoLeHEOE5MfiG).
- *  - FMEA: Implements 50-record batching and robust try/catch logging.
- *
- *  CHANGELOG v1.7:
- *  - REVERT: fld1eoLeHEOE5MfiG (SPD Stock Status) IS a real field — confirmed via handover doc.
- *            Removed incorrect Flagged_For_Legacy (fldhoxG1zhcYnSeMd) writes from EOR/DD branches.
- *  - FIX: EOR branch now writes FULL stock payload (SOH, SAV, SOO, ETA, logistics) THEN sets
- *          Stock Status = "End of Range" on SPD.
- *  - FIX: DD branch now writes full stock payload THEN sets Stock Status = "Discontinued" on SPD.
- *  - NOTE: ZAB suffixes (Z/B/A) are PLU lifecycle — completely separate from EOR/DD status.
- *          Script 1 never touches PLU suffixes. Script 0A owns that logic.
+ * SCRIPT 1 — ETL ROUTER v1.8
+ * Improvements: Complete stdEngine, error handling, fixed numeric parser, batch recovery
  */
 
-const OVERWRITE_DESCRIPTION = false;
+const DRY_RUN = false;
 
-async function main() {
-  // ============================================================
-  // 1. TABLE DEFINITIONS
-  // ============================================================
-  const stagingTable = base.getTable("tblcPSP5NcP0ioUP8");
-  const spdTable = base.getTable("tbl7mZpHJCUs1r0cg");
-  const adminLogs = base.getTable("tblk1v5VHPEC2c2u2");
-  const standardizationTbl = base.getTable("tblMdVyuaCBG40uQP");
+const TABLES = {
+  STAGING: "tblcPSP5NcP0ioUP8",
+  SPD: "tbl7mZpHJCUs1r0cg",
+  PM: "tblgLqMMXX2HcKt9U",
+  ADMIN_LOGS: "tblk1v5VHPEC2c2u2",
+  STD: "tblMdVyuaCBG40uQP"
+};
 
-  output.markdown("# 🔀 Script 1 — ETL Router v1.6");
-  output.markdown(`> Running at: \`${new Date().toLocaleString()}\``);
-  output.markdown(
-    "> Standardization: **active** | Dimension parser: **active** | EOR Logic: **active**",
-  );
-  output.markdown("---");
+// Staging Fields
+const S_SUPPLIER_SKU = "fldeEd9FiNq5AtGNk";
+const S_IMPORT_TYPE = "fldjdRY1TAJypmcPF";
+const S_ETL_STATUS = "fldbrUDvLv8OEnEqh";
+const S_NO_FACES = "fldkh9EFaIKvc0yIj";
+const S_THICKNESS = "fldbgiMR2Qlm169Mu";
+const S_BODY_TYPE = "fldIEO5cTzgLSSOC0";
+const S_BODY_FINISH = "fld4QhEwwFSgFsHRB";
+const S_PEI_CLASS = "fldqFzEPIby2C94Du";
+const S_SLIP_RATING = "fldfMSgqnPwP2hvtl";
+// Logistics
+const S_PCE_BOX = "fldiTSUcLPa4uLT4L";
+const S_SQM_BOX = "fldvVC9z72GqYdDko";
+const S_KG_BOX = "fldS2mZdWoY7hPU3G";
+const S_BOX_PALLET = "fld8Qz10GgXiS6Da5";
+const S_SQM_PALLET = "fldf5VU6KDd2cSqUB";
+const S_KG_PALLET = "fldOfxvmWk1K1J0TQ";
+const S_DIMENSIONS = "fldvZjLna62iMbj5K";
+const S_DESCRIPTION = "fldkAm1iLOJJYmzmi";
+const S_SOH = "fldhNujCBWdylBEzS";
+const S_SAV = "fldqPizK5v1z69O7L";
+const S_SOO = "fld6ich1CWKGs0tur";
+const S_ETA = "fldcvr9PjTp0HeKnB";
+const S_EOR_STOCK = "fld4WI1P7S1cGxoyo";
 
-  // ============================================================
-  // STEP 1 — Load Standardization engine into memory
-  // ============================================================
-  output.markdown("## Step 1 — Loading Standardization engine...");
+// SPD Fields
+const SPD_DATA_ID = "fldmeU6JZIwvGAuRH";
+const SPD_SKU = "fldK3FyPA98F3smc9";
+const SPD_PM_LINK = "fldGxaIlPVor7QEwN";
+const SPD_BODY = "fldtMpYo9uqtirVW7";
+const SPD_FINISH = "fldeiQRu0fp13cMyL";
+const SPD_DIMENSIONS = "fldqkhCrXeaEsmKuQ";
+const SPD_SIZE_LEN = "fldQns7cT9JDqHy0Z";
+const SPD_SIZE_WID = "fldeQy5c79koW7ABQ";
+const SPD_DESC = "fldoROoSpEm5FuUnI";
+const SPD_SOH = "fldnYxUVqYOTvBNVd";
+const SPD_SAV = "fldW44uBVVT9aqrcP";
+const SPD_SOO = "fld8JnU93aeUkXYD5";
+const SPD_ETA = "fldDkxV0hYu2u3X2j";
+const SPD_STOCK_UPDATE = "fldcq3PzsLthtvh2v";
+const SPD_EOR_STOCK = "fldzSJKZBdkGeWAdi";
+const SPD_STOCK_STATUS = "fld1eoLeHEOE5MfiG";
+// Logistics SPD
+const SPD_PCE_BOX = "fldSgGBl9MmbFNgfi";
+const SPD_SQM_BOX = "fldv7C2yxJqMMwy71";
+const SPD_KG_BOX = "fld9YEiSLAsO2D49B";
+const SPD_BOX_PALLET = "fld3SEg2FtEQGpqOA";
+const SPD_SQM_PALLET = "fld1xHQZEyBLByG60";
+const SPD_KG_PALLET = "fldW0kGw6FI6fBXEu";
 
-  const stdQuery = await standardizationTbl.selectRecordsAsync({
-    fields: [
-      "fldKYwVJHHTfloR8h", // Category
-      "fldOdvbGYRzfU6VmS", // Field Name
-      "fldm5CSkaVnCXIxOt", // Example Input
-      "fldBmRaivNGM1s7bS", // Example Output
-      "fldid3LYwJeC8bx7e", // Automated Standardization Feasible
-    ],
-  });
+// AdminLogs
+const LOG_NOTES = "fld4l6AJhVNRzIaY8";
+const LOG_TYPE = "flda8oHUThBc1Kb7I";
+const LOG_SEVERITY = "fldPdoc6JPYHV9gpb";
+const LOG_STATUS = "fldog9l4DwJeE5Qj8";
 
-  const stdEngine = {};
-  let stdRulesLoaded = 0;
+// ────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────
 
-  for (const r of stdQuery.records) {
-    const feasible = r.getCellValueAsString("fldid3LYwJeC8bx7e");
-    const category = r
-      .getCellValueAsString("fldKYwVJHHTfloR8h")
-      .trim()
-      .toUpperCase();
-    const rawInput = r.getCellValueAsString("fldm5CSkaVnCXIxOt").trim();
-    const output_ = r.getCellValueAsString("fldBmRaivNGM1s7bS").trim();
-
-    if (!rawInput || !output_ || !category) continue;
-
-    if (feasible === "Yes") {
-      const key = `${category}|${rawInput.toUpperCase()}`;
-      stdEngine[key] = output_;
-      stdRulesLoaded++;
-    }
+function parseNumeric(val) {
+  if (val === null || val === undefined || val === "") return null;
+  let s = String(val).trim();
+  // European format: "1.500,50" → 1500.50
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else {
+    s = s.replace(/,(?=\d{3})/g, "").replace(",", ".");
   }
-
-  output.markdown(
-    `✅ Standardization engine loaded: **${stdRulesLoaded} rules**`,
-  );
-
-  const applyStd = (category, rawValue) => {
-    if (!rawValue) return rawValue;
-    const key = `${category.toUpperCase()}|${String(rawValue).trim().toUpperCase()}`;
-    return stdEngine[key] || rawValue;
-  };
-
-  // ============================================================
-  // STEP 2 — Dimension parser
-  // ============================================================
-  const parseDimensions = (raw) => {
-    if (!raw) return null;
-    const isCm = /\bcm\b/i.test(raw);
-
-    const cleaned = raw
-      .replace(/mm|cm/gi, "")
-      .replace(/[x×\*✕]/gi, "|")
-      .replace(/\s+/g, "")
-      .trim();
-    const parts = cleaned.split("|").filter((p) => p !== "");
-    if (parts.length < 2) return null;
-
-    const a = parseFloat(parts[0]); // FIX: parts is array; was parseFloat(parts) which returns NaN
-    const b = parseFloat(parts[1]);
-    if (isNaN(a) || isNaN(b)) return null;
-
-    const multiplier = isCm ? 10 : 1;
-    const lenMM = Math.round(Math.max(a, b) * multiplier);
-    const widMM = Math.round(Math.min(a, b) * multiplier);
-
-    return { length: lenMM, width: widMM };
-  };
-
-  // ============================================================
-  // STEP 3 — Load pending Staging records
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## Step 2 — Loading pending Staging records...");
-
-  const stagingQuery = await stagingTable.selectRecordsAsync({
-    fields: [
-      "fldeEd9FiNq5AtGNk", // Supplier SKU
-      "fldjdRY1TAJypmcPF", // Import Type
-      "fldbrUDvLv8OEnEqh", // Sys Etl Process Status
-      "fldbffhLGECRlzSt2", // Source Metadata Link
-      // Stock fields
-      "fldhNujCBWdylBEzS", // Stock On Hand
-      "fldqPizK5v1z69O7L", // Stock Available
-      "fld4WI1P7S1cGxoyo", // Stock On Hand EOR
-      "fld6ich1CWKGs0tur", // Stock On Order
-      "fldcvr9PjTp0HeKnB", // Stock ETA
-      // Logistics Fields (ADDED v1.6)
-      "fldiTSUcLPa4uLT4L", // Pce Box
-      "fldvVC9z72GqYdDko", // Sqm Box
-      "fldS2mZdWoY7hPU3G", // Kg Box
-      "fld8Qz10GgXiS6Da5", // Box Pallet
-      "fldf5VU6KDd2cSqUB", // Sqm Pallet
-      "fldOfxvmWk1K1J0TQ", // Kg Pallet
-      // Descriptive fields
-      "fldkAm1iLOJJYmzmi", // Supplier Product Description
-      "fldvZjLna62iMbj5K", // Dimensions MM
-      "fld4QhEwwFSgFsHRB", // Body Finish
-      // NOTE: Country Origin is not a Staging field — it is sourced from SPD (fldhE2dMfNk1rLJ8V)
-      // FIX: removed fldFYaZM86ortnRZA which does not exist in Staging schema
-    ],
-  });
-
-  const pendingRows = stagingQuery.records.filter(
-    (r) => r.getCellValueAsString("fldbrUDvLv8OEnEqh") === "pending",
-  );
-
-  output.markdown(
-    `✅ Found **${pendingRows.length}** pending Staging records.`,
-  );
-  if (pendingRows.length === 0) {
-    output.markdown("Nothing to process. Exiting.");
-    return;
-  }
-
-  const byType = { ST: [], EOR: [], DD: [], PR: [], OTHER: [] };
-  for (const r of pendingRows) {
-    const t = r.getCellValueAsString("fldjdRY1TAJypmcPF");
-    if (t.startsWith("ST")) byType.ST.push(r);
-    else if (t.startsWith("EOR")) byType.EOR.push(r);
-    else if (t.startsWith("DD")) byType.DD.push(r);
-    else if (t.startsWith("PR")) byType.PR.push(r);
-    else byType.OTHER.push(r);
-  }
-
-  // ============================================================
-  // STEP 4 — Load SPD index
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## Step 3 — Loading SPD index...");
-
-  const spdQuery = await spdTable.selectRecordsAsync({
-    fields: [
-      "fldmeU6JZIwvGAuRH", // Supplier Product Data ID
-      "fldK3FyPA98F3smc9", // Supplier SKU
-      "fldoROoSpEm5FuUnI", // Supplier Product Description
-      "fldhE2dMfNk1rLJ8V", // Country Origin
-      "fldeiQRu0fp13cMyL", // Supplier Body Finish
-      "fldqkhCrXeaEsmKuQ", // Dimensions_Raw
-      "fldQns7cT9JDqHy0Z", // Size Length MM
-      "fldeQy5c79koW7ABQ", // Size Width MM
-      "fldK2EV1veOvEkCpu", // SPD Stock Status (singleSelect) - Corrected Schema Field ID applied
-      // Logistics Fields
-      "fldSgGBl9MmbFNgfi", // Pce Box
-      "fldv7C2yxJqMMwy71", // Sqm Box
-      "fld9YEiSLAsO2D49B", // Kg Box
-      "fld3SEg2FtEQGpqOA", // Box Pallet
-      "fld1xHQZEyBLByG60", // Sqm Pallet
-      "fldW0kGw6FI6fBXEu", // Kg Pallet
-    ],
-  });
-
-  const spdIndex = {};
-  for (const rec of spdQuery.records) {
-    const key = rec
-      .getCellValueAsString("fldmeU6JZIwvGAuRH")
-      .trim()
-      .toUpperCase();
-    if (key) spdIndex[key] = rec;
-  }
-
-  const normSku = (s) =>
-    String(s || "")
-      .replace(/[-\s]/g, "")
-      .trim()
-      .toUpperCase();
-
-  // ============================================================
-  // STEP 5 — Process
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## Step 4 — Processing...");
-
-  const chunk = (arr, n) => {
-    const o = [];
-    for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n));
-    return o;
-  };
-
-  // FIX: was using getCellValueAsString which coerces 0 → "0" → truthy → would write over zeros
-  // Now uses getCellValue directly and checks for null/undefined/empty string only
-  const nullSafe = (spdRec, fieldId, value) => {
-    if (!value && value !== 0) return null;
-    const existing = spdRec.getCellValue(fieldId);
-    if (existing !== null && existing !== undefined && existing !== "")
-      return null;
-    return value;
-  };
-
-  const nullSafeDim = (spdRec, fieldId, value) => {
-    if (!value) return null;
-    const existing = spdRec.getCellValue(fieldId);
-    if (existing && existing > 0) return null;
-    return value;
-  };
-
-  // ADDED v1.6: Protects existing logistical numbers
-  const nullSafeNum = (spdRec, fieldId, newValue) => {
-    if (newValue === null || newValue === undefined) return null;
-    const existing = spdRec.getCellValue(fieldId);
-    if (existing !== null && existing !== undefined && existing !== "")
-      return null;
-    return newValue;
-  };
-
-  let countUpdated = 0,
-    countCreated = 0,
-    countFailed = 0,
-    countDimParsed = 0;
-  const stagingUpdates = [],
-    spdUpdates = [],
-    spdCreates = [],
-    adminLogCreates = [];
-  const toProcess = [...byType.ST, ...byType.EOR, ...byType.DD];
-
-  for (const stagingRec of toProcess) {
-    const importType = stagingRec.getCellValueAsString("fldjdRY1TAJypmcPF");
-    const rawSku = stagingRec.getCellValueAsString("fldeEd9FiNq5AtGNk").trim();
-    const normKey = normSku(rawSku);
-
-    if (!normKey) {
-      countFailed++;
-      stagingUpdates.push({
-        id: stagingRec.id,
-        fields: { fldbrUDvLv8OEnEqh: { name: "failed" } },
-      });
-      continue;
-    }
-
-    const spdRec = spdIndex[normKey];
-
-    try {
-      if (importType.startsWith("ST")) {
-        const payload = {};
-
-        // --- Stock fields (always overwrite) ---
-        const soh = stagingRec.getCellValue("fldhNujCBWdylBEzS");
-        const sav = stagingRec.getCellValue("fldqPizK5v1z69O7L");
-        const soo = stagingRec.getCellValue("fld6ich1CWKGs0tur");
-        const eta = stagingRec.getCellValueAsString("fldcvr9PjTp0HeKnB");
-
-        if (soh !== null) payload["fldnYxUVqYOTvBNVd"] = soh;
-        if (sav !== null) payload["fldW44uBVVT9aqrcP"] = sav;
-        if (soo !== null) payload["fld8JnU93aeUkXYD5"] = soo;
-        if (eta) payload["fldDkxV0hYu2u3X2j"] = eta;
-        payload["fldcq3PzsLthtvh2v"] = new Date().toISOString().split("T")[0]; // FIX: [0] required — split returns array
-
-        // --- Dimension parser ---
-        const rawDim = stagingRec
-          .getCellValueAsString("fldvZjLna62iMbj5K")
-          .trim();
-        if (rawDim) {
-          const dims = parseDimensions(rawDim);
-          if (dims) {
-            countDimParsed++;
-            if (spdRec) {
-              payload["fldqkhCrXeaEsmKuQ"] = rawDim;
-              const ns_len = nullSafeDim(
-                spdRec,
-                "fldQns7cT9JDqHy0Z",
-                dims.length,
-              );
-              const ns_wid = nullSafeDim(
-                spdRec,
-                "fldeQy5c79koW7ABQ",
-                dims.width,
-              );
-              if (ns_len) payload["fldQns7cT9JDqHy0Z"] = ns_len;
-              if (ns_wid) payload["fldeQy5c79koW7ABQ"] = ns_wid;
-            }
-          }
-        }
-
-        // Script 1 — ST branch, when writing BODY to SPD (fldtMpYo9uqtirVW7):
-        const rawBody = stagingRec
-          .getCellValueAsString("fldIEO5cTzgLSSOC0")
-          .trim()
-          .replace(/[\r\n]+/g, " ") // collapse embedded newlines to space
-          .replace(/\s+/g, " ") // normalise multiple spaces
-          .trim();
-
-        // Then pass through the standardisation engine with category "Body Type":
-        const cleanBody = applyStd("Body Type", rawBody);
-        // "Ceramic White" → "Ceramic", "Porcelain Glazed" → "Porcelain" etc.
-
-        if (cleanBody && spdRec) {
-          const nsBody = nullSafe(spdRec, "fldtMpYo9uqtirVW7", cleanBody);
-          if (nsBody) payload["fldtMpYo9uqtirVW7"] = nsBody;
-        }
-
-        // --- Body Finish ---
-        const rawFinish = stagingRec
-          .getCellValueAsString("fld4QhEwwFSgFsHRB")
-          .trim();
-        if (rawFinish) {
-          const cleanFinish = applyStd("Body Finish", rawFinish);
-          if (spdRec) {
-            const ns_finish = nullSafe(
-              spdRec,
-              "fldeiQRu0fp13cMyL",
-              cleanFinish,
-            );
-            if (ns_finish) payload["fldeiQRu0fp13cMyL"] = ns_finish;
-          } else {
-            payload["fldeiQRu0fp13cMyL"] = cleanFinish;
-          }
-        }
-
-        if (spdRec) {
-          // --- UPDATING EXISTING SPD ---
-          const incomingDesc = stagingRec
-            .getCellValueAsString("fldkAm1iLOJJYmzmi")
-            .trim();
-          const existingDesc = spdRec
-            .getCellValueAsString("fldoROoSpEm5FuUnI")
-            .trim();
-
-          if (incomingDesc && (existingDesc === "" || OVERWRITE_DESCRIPTION)) {
-            payload["fldoROoSpEm5FuUnI"] = incomingDesc;
-          }
-
-          // FIX: Country Origin (fldFYaZM86ortnRZA) does not exist in Staging schema.
-          // Country Origin on SPD (fldhE2dMfNk1rLJ8V) is populated from the supplier
-          // stocklist directly via the SPD create path — not from a Staging field.
-          // Removed: const countryVal = stagingRec.getCellValue("fldFYaZM86ortnRZA")
-
-          // --- Logistics (ADDED v1.6) ---
-          const ns_pceBox = nullSafeNum(
-            spdRec,
-            "fldSgGBl9MmbFNgfi",
-            stagingRec.getCellValue("fldiTSUcLPa4uLT4L"),
-          );
-          const ns_sqmBox = nullSafeNum(
-            spdRec,
-            "fldv7C2yxJqMMwy71",
-            stagingRec.getCellValue("fldvVC9z72GqYdDko"),
-          );
-          const ns_kgBox = nullSafeNum(
-            spdRec,
-            "fld9YEiSLAsO2D49B",
-            stagingRec.getCellValue("fldS2mZdWoY7hPU3G"),
-          );
-          const ns_bxPal = nullSafeNum(
-            spdRec,
-            "fld3SEg2FtEQGpqOA",
-            stagingRec.getCellValue("fld8Qz10GgXiS6Da5"),
-          );
-          const ns_sqmPal = nullSafeNum(
-            spdRec,
-            "fld1xHQZEyBLByG60",
-            stagingRec.getCellValue("fldf5VU6KDd2cSqUB"),
-          );
-          const ns_kgPal = nullSafeNum(
-            spdRec,
-            "fldW0kGw6FI6fBXEu",
-            stagingRec.getCellValue("fldOfxvmWk1K1J0TQ"),
-          );
-
-          if (ns_pceBox !== null) payload["fldSgGBl9MmbFNgfi"] = ns_pceBox;
-          if (ns_sqmBox !== null) payload["fldv7C2yxJqMMwy71"] = ns_sqmBox;
-          if (ns_kgBox !== null) payload["fld9YEiSLAsO2D49B"] = ns_kgBox;
-          if (ns_bxPal !== null) payload["fld3SEg2FtEQGpqOA"] = ns_bxPal;
-          if (ns_sqmPal !== null) payload["fld1xHQZEyBLByG60"] = ns_sqmPal;
-          if (ns_kgPal !== null) payload["fldW0kGw6FI6fBXEu"] = ns_kgPal;
-
-          spdUpdates.push({ id: spdRec.id, fields: payload });
-          countUpdated++;
-        } else {
-          // --- CREATING NEW SPD ---
-          payload["fldK3FyPA98F3smc9"] = rawSku;
-          const desc = stagingRec
-            .getCellValueAsString("fldkAm1iLOJJYmzmi")
-            .trim();
-          if (desc) payload["fldoROoSpEm5FuUnI"] = desc;
-          // FIX: Country Origin removed — field does not exist in Staging schema (see note above)
-          if (rawDim) payload["fldqkhCrXeaEsmKuQ"] = rawDim;
-
-          // --- Logistics (ADDED v1.6) ---
-          const pce = stagingRec.getCellValue("fldiTSUcLPa4uLT4L");
-          const sqm = stagingRec.getCellValue("fldvVC9z72GqYdDko");
-          const kg = stagingRec.getCellValue("fldS2mZdWoY7hPU3G");
-          const bxP = stagingRec.getCellValue("fld8Qz10GgXiS6Da5");
-          const sqmP = stagingRec.getCellValue("fldf5VU6KDd2cSqUB");
-          const kgP = stagingRec.getCellValue("fldOfxvmWk1K1J0TQ");
-
-          if (pce !== null) payload["fldSgGBl9MmbFNgfi"] = pce;
-          if (sqm !== null) payload["fldv7C2yxJqMMwy71"] = sqm;
-          if (kg !== null) payload["fld9YEiSLAsO2D49B"] = kg;
-          if (bxP !== null) payload["fld3SEg2FtEQGpqOA"] = bxP;
-          if (sqmP !== null) payload["fld1xHQZEyBLByG60"] = sqmP;
-          if (kgP !== null) payload["fldW0kGw6FI6fBXEu"] = kgP;
-
-          spdCreates.push({ fields: payload });
-          countCreated++;
-        }
-
-        stagingUpdates.push({
-          id: stagingRec.id,
-          fields: { fldbrUDvLv8OEnEqh: { name: "processed" } },
-        });
-      } else if (importType.startsWith("EOR")) {
-        // ------------------------------------------------
-        // ------------------------------------------------
-        // EOR v1.7 — Full stock write + Stock Status = End of Range
-        // EOR files carry clearance stockholding — write all stock fields first,
-        // then stamp Stock Status. ZAB suffixes are PLU-only; not touched here.
-        // ------------------------------------------------
-        if (spdRec) {
-          const eorPayload = {};
-
-          // Full stock write (EOR files carry clearance SOH/SAV/SOO/ETA)
-          const soh = stagingRec.getCellValue("fldhNujCBWdylBEzS");
-          const sav = stagingRec.getCellValue("fldqPizK5v1z69O7L");
-          const soo = stagingRec.getCellValue("fld6ich1CWKGs0tur");
-          const eta = stagingRec.getCellValueAsString("fldcvr9PjTp0HeKnB");
-          const eorStock = stagingRec.getCellValue("fld4WI1P7S1cGxoyo"); // EOR-specific clearance SOH
-
-          if (soh !== null) eorPayload["fldnYxUVqYOTvBNVd"] = soh;
-          if (sav !== null) eorPayload["fldW44uBVVT9aqrcP"] = sav;
-          if (soo !== null) eorPayload["fld8JnU93aeUkXYD5"] = soo;
-          if (eta) eorPayload["fldDkxV0hYu2u3X2j"] = eta;
-          if (eorStock !== null && eorStock !== undefined)
-            eorPayload["fldzSJKZBdkGeWAdi"] = eorStock;
-
-          eorPayload["fldcq3PzsLthtvh2v"] = new Date()
-            .toISOString()
-            .split("T")[0];
-
-          // Logistics (null-safe — don't overwrite existing)
-          const ns_pceBox = nullSafeNum(
-            spdRec,
-            "fldSgGBl9MmbFNgfi",
-            stagingRec.getCellValue("fldiTSUcLPa4uLT4L"),
-          );
-          const ns_sqmBox = nullSafeNum(
-            spdRec,
-            "fldv7C2yxJqMMwy71",
-            stagingRec.getCellValue("fldvVC9z72GqYdDko"),
-          );
-          const ns_kgBox = nullSafeNum(
-            spdRec,
-            "fld9YEiSLAsO2D49B",
-            stagingRec.getCellValue("fldS2mZdWoY7hPU3G"),
-          );
-          const ns_bxPal = nullSafeNum(
-            spdRec,
-            "fld3SEg2FtEQGpqOA",
-            stagingRec.getCellValue("fld8Qz10GgXiS6Da5"),
-          );
-          const ns_sqmPal = nullSafeNum(
-            spdRec,
-            "fld1xHQZEyBLByG60",
-            stagingRec.getCellValue("fldf5VU6KDd2cSqUB"),
-          );
-          const ns_kgPal = nullSafeNum(
-            spdRec,
-            "fldW0kGw6FI6fBXEu",
-            stagingRec.getCellValue("fldOfxvmWk1K1J0TQ"),
-          );
-
-          if (ns_pceBox !== null) eorPayload["fldSgGBl9MmbFNgfi"] = ns_pceBox;
-          if (ns_sqmBox !== null) eorPayload["fldv7C2yxJqMMwy71"] = ns_sqmBox;
-          if (ns_kgBox !== null) eorPayload["fld9YEiSLAsO2D49B"] = ns_kgBox;
-          if (ns_bxPal !== null) eorPayload["fld3SEg2FtEQGpqOA"] = ns_bxPal;
-          if (ns_sqmPal !== null) eorPayload["fld1xHQZEyBLByG60"] = ns_sqmPal;
-          if (ns_kgPal !== null) eorPayload["fldW0kGw6FI6fBXEu"] = ns_kgPal;
-
-          // Lifecycle signal — AFTER stock write
-          // NOTE: This is supplier-side product status. Completely separate from ZAB PLU suffixes.
-
-          spdUpdates.push({ id: spdRec.id, fields: eorPayload });
-          countUpdated++;
-        }
-        stagingUpdates.push({
-          id: stagingRec.id,
-          fields: { fldbrUDvLv8OEnEqh: { name: "processed" } },
-        });
-      } else if (importType.startsWith("DD")) {
-        // ------------------------------------------------
-        // DD v1.7 — Full stock snapshot write + Stock Status = Discontinued
-        // DD files carry product attributes and a final stock snapshot.
-        // ZAB suffixes are PLU-only; not touched here.
-        // ------------------------------------------------
-        if (spdRec) {
-          const ddPayload = {};
-
-          // Full stock write (DD files may carry final stock snapshot)
-          const soh = stagingRec.getCellValue("fldhNujCBWdylBEzS");
-          const sav = stagingRec.getCellValue("fldqPizK5v1z69O7L");
-          const soo = stagingRec.getCellValue("fld6ich1CWKGs0tur");
-          const eta = stagingRec.getCellValueAsString("fldcvr9PjTp0HeKnB");
-
-          if (soh !== null) ddPayload["fldnYxUVqYOTvBNVd"] = soh;
-          if (sav !== null) ddPayload["fldW44uBVVT9aqrcP"] = sav;
-          if (soo !== null) ddPayload["fld8JnU93aeUkXYD5"] = soo;
-          if (eta) ddPayload["fldDkxV0hYu2u3X2j"] = eta;
-
-          ddPayload["fldcq3PzsLthtvh2v"] = new Date()
-            .toISOString()
-            .split("T")[0];
-
-          // Lifecycle signal — AFTER stock write
-          // NOTE: Discontinued = supplier status. ZAB Z-suffix is PLU lifecycle — separate system.
-
-          spdUpdates.push({ id: spdRec.id, fields: ddPayload });
-          countUpdated++;
-        }
-        stagingUpdates.push({
-          id: stagingRec.id,
-          fields: { fldbrUDvLv8OEnEqh: { name: "processed" } },
-        });
-      }
-    } catch (err) {
-      countFailed++;
-      stagingUpdatesMap.set(stagingRec.id, {
-        id: stagingRec.id,
-        fields: { fldbrUDvLv8OEnEqh: "failed" },
-      });
-      await adminLogs.createRecordAsync({
-        fld4l6AJhVNRzIaY8: `Script 1 failure - SKU ${rawSku}: ${err.message}`,
-        flda8oHUThBc1Kb7I: {
-          name: "System_Event (A catch-all for scripts starting/finishing)",
-        },
-        fldPdoc6JPYHV9gpb: { name: "High" },
-        fldog9l4DwJeE5Qj8: { name: "Error (If the script itself crashed" }, // Matched exact schema string (including missing parenthesis)
-      });
-    }
-  }
-
-  // ============================================================
-  // STEP 6 — Commit all writes
-  // ============================================================
-  output.markdown("---");
-  output.markdown("## Step 5 — Writing to Airtable...");
-
-  if (spdCreates.length > 0) {
-    for (const batch of chunk(spdCreates, 50))
-      await spdTable.createRecordsAsync(batch);
-    output.markdown(`✅ Created **${spdCreates.length}** new SPD records.`);
-  }
-
-  if (spdUpdates.length > 0) {
-    for (const batch of chunk(spdUpdates, 50))
-      await spdTable.updateRecordsAsync(batch);
-    output.markdown(`✅ Updated **${spdUpdates.length}** SPD records.`);
-  }
-
-  if (stagingUpdates.length > 0) {
-    for (const batch of chunk(stagingUpdates, 50))
-      await stagingTable.updateRecordsAsync(batch);
-    output.markdown(
-      `✅ Updated **${stagingUpdates.length}** Staging statuses.`,
-    );
-  }
-
-  output.markdown("---");
-  output.markdown("## ✅ Run Complete");
+  s = s.replace(/[^0-9.-]/g, "");
+  const n = parseFloat(s);
+  return isNaN(n) ? null : n;
 }
 
-main();
+function parseDimensions(raw) {
+  if (!raw) return null;
+  const isCm = /\bcm\b/i.test(raw);
+  const cleaned = raw
+    .replace(/mm|cm/gi, "")
+    .replace(/[x×\*✕]/gi, "|")
+    .replace(/\s+/g, "")
+    .trim();
+  const parts = cleaned.split("|").filter((p) => p !== "");
+  if (parts.length < 2) return null;
+  
+  const a = parseFloat(parts[0]);
+  const b = parseFloat(parts[1]);
+  if (isNaN(a) || isNaN(b)) return null;
+  
+  const multiplier = isCm ? 10 : 1;
+  return {
+    length: Math.round(Math.max(a, b) * multiplier),
+    width: Math.round(Math.min(a, b) * multiplier)
+  };
+}
+
+function sanitize(val) {
+  if (!val) return "";
+  return String(val)
+    .replace(/[\n\r]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function nullSafe(spdRec, fieldId, newValue) {
+  if (newValue === null || newValue === undefined) return null;
+  const existing = spdRec.getCellValue(fieldId);
+  // Only skip write if field already populated
+  if (existing !== null && existing !== undefined && existing !== "" && existing !== 0) return null;
+  return newValue;
+}
+
+const chunk = (arr, n) => {
+  const o = [];
+  for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n));
+  return o;
+};
+
+const normSku = (s) =>
+  String(s || "").replace(/[-\s]/g, "").trim().toUpperCase();
+
+async function main() {
+  output.markdown("# 🔀 Script 1 — ETL Router v1.8");
+  if (DRY_RUN) output.markdown("> ⚠️ **DRY RUN MODE**");
+  
+  const stagingTable = base.getTable(TABLES.STAGING);
+  const spdTable = base.getTable(TABLES.SPD);
+  const stdTable = base.getTable(TABLES.STD);
+  const adminLogs = base.getTable(TABLES.ADMIN_LOGS);
+  
+  try {
+    // ────────────────────────────────────────────────────────
+    // STEP 1 — Load & Build Standardization Engine
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 1 — Loading Standardization Engine...");
+    
+    const stdQuery = await stdTable.selectRecordsAsync({
+      fields: [
+        "fldKYwVJHHTfloR8h", // Category
+        "fldm5CSkaVnCXIxOt", // Example Input
+        "fldBmRaivNGM1s7bS" // Example Output
+      ]
+    });
+    
+    const stdEngine = {};
+    for (const r of stdQuery.records) {
+      const cat = r.getCellValueAsString("fldKYwVJHHTfloR8h").trim().toUpperCase();
+      const inp = r.getCellValueAsString("fldm5CSkaVnCXIxOt").trim().toUpperCase();
+      const out = r.getCellValueAsString("fldBmRaivNGM1s7bS").trim();
+      
+      if (cat && inp && out) {
+        stdEngine[`${cat}|${inp}`] = out;
+      }
+    }
+    
+    output.markdown(`✅ Standardization engine: **${Object.keys(stdEngine).length}** rules`);
+    
+    const applyStd = (category, rawValue) => {
+      if (!rawValue) return rawValue;
+      const key = `${category.toUpperCase()}|${String(rawValue).trim().toUpperCase()}`;
+      return stdEngine[key] || rawValue;
+    };
+    
+    // ────────────────────────────────────────────────────────
+    // STEP 2 — Load pending Staging
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 2 — Loading pending Staging...");
+    
+    const stagingQ = await stagingTable.selectRecordsAsync({
+      fields: [
+        S_SUPPLIER_SKU, S_IMPORT_TYPE, S_ETL_STATUS,
+        S_SOH, S_SAV, S_SOO, S_ETA, S_EOR_STOCK,
+        S_DIMENSIONS, S_DESCRIPTION, S_BODY_TYPE, S_BODY_FINISH,
+        S_NO_FACES, S_THICKNESS, S_PEI_CLASS, S_SLIP_RATING,
+        S_PCE_BOX, S_SQM_BOX, S_KG_BOX, S_BOX_PALLET, S_SQM_PALLET, S_KG_PALLET
+      ]
+    });
+    
+    const pendingRows = stagingQ.records.filter(
+      (r) => r.getCellValueAsString(S_ETL_STATUS) === "pending"
+    );
+    
+    output.markdown(`✅ Found **${pendingRows.length}** pending rows`);
+    
+    if (pendingRows.length === 0) {
+      output.markdown("Nothing to process.");
+      return;
+    }
+    
+    // ────────────────────────────────────────────────────────
+    // STEP 3 — Load SPD index
+    // ────────────────────────────────────────────────────────
+    const spdQ = await spdTable.selectRecordsAsync({
+      fields: [
+        SPD_DATA_ID, SPD_SKU, SPD_PM_LINK,
+        SPD_SOH, SPD_SAV, SPD_SOO, SPD_ETA, SPD_STOCK_UPDATE,
+        SPD_BODY, SPD_FINISH, SPD_DIMENSIONS, SPD_SIZE_LEN, SPD_SIZE_WID,
+        SPD_DESC, SPD_STOCK_STATUS,
+        SPD_PCE_BOX, SPD_SQM_BOX, SPD_KG_BOX, SPD_BOX_PALLET, SPD_SQM_PALLET, SPD_KG_PALLET
+      ]
+    });
+    
+    const spdIndex = {};
+    for (const rec of spdQ.records) {
+      const key = rec.getCellValueAsString(SPD_DATA_ID).trim().toUpperCase();
+      if (key) spdIndex[key] = rec;
+    }
+    
+    output.markdown(`✅ Indexed **${Object.keys(spdIndex).length}** SPD records`);
+    
+    // ────────────────────────────────────────────────────────
+    // STEP 4 — Process rows
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 3 — Processing...");
+    
+    const spdUpdates = [], spdCreates = [], stagingUpdates = [], adminLogs_arr = [];
+    let procCount = 0, failCount = 0;
+    
+    for (const stagingRec of pendingRows) {
+      const importType = stagingRec.getCellValueAsString(S_IMPORT_TYPE);
+      const rawSku = stagingRec.getCellValueAsString(S_SUPPLIER_SKU).trim();
+      const normKey = normSku(rawSku);
+      
+      try {
+        if (!normKey) throw new Error(`Invalid SKU: ${rawSku}`);
+        
+        const spdRec = spdIndex[normKey];
+        
+        if (importType.toUpperCase().startsWith("ST")) {
+          // ───── STOCK TRANSFER LOGIC ─────
+          const payload = {};
+          
+          // Stock fields (always overwrite)
+          const soh = stagingRec.getCellValue(S_SOH);
+          const sav = stagingRec.getCellValue(S_SAV);
+          const soo = stagingRec.getCellValue(S_SOO);
+          const eta = stagingRec.getCellValueAsString(S_ETA);
+          
+          if (soh !== null) payload[SPD_SOH] = soh;
+          if (sav !== null) payload[SPD_SAV] = sav;
+          if (soo !== null) payload[SPD_SOO] = soo;
+          if (eta) payload[SPD_ETA] = eta;
+          payload[SPD_STOCK_UPDATE] = new Date().toISOString().split("T")[0];
+          
+          // Dimensions
+          const rawDim = stagingRec.getCellValueAsString(S_DIMENSIONS).trim();
+          if (rawDim) {
+            const dims = parseDimensions(rawDim);
+            if (dims) {
+              payload[SPD_DIMENSIONS] = rawDim;
+              if (spdRec) {
+                const existLen = spdRec.getCellValue(SPD_SIZE_LEN);
+                const existWid = spdRec.getCellValue(SPD_SIZE_WID);
+                if (!existLen) payload[SPD_SIZE_LEN] = dims.length;
+                if (!existWid) payload[SPD_SIZE_WID] = dims.width;
+              }
+            }
+          }
+          
+          // Body Type (standardized)
+          const rawBody = sanitize(stagingRec.getCellValueAsString(S_BODY_TYPE));
+          if (rawBody) {
+            const cleanBody = applyStd("BODY TYPE", rawBody);
+            payload[SPD_BODY] = cleanBody;
+          }
+          
+          // Body Finish (standardized)
+          const rawFinish = sanitize(stagingRec.getCellValueAsString(S_BODY_FINISH));
+          if (rawFinish) {
+            const cleanFinish = applyStd("BODY FINISH", rawFinish);
+            payload[SPD_FINISH] = cleanFinish;
+          }
+          
+          // Description
+          const rawDesc = stagingRec.getCellValueAsString(S_DESCRIPTION).trim();
+          if (rawDesc && spdRec) {
+            const existing = spdRec.getCellValueAsString(SPD_DESC);
+            if (!existing) payload[SPD_DESC] = rawDesc;
+          }
+          
+          // Logistics (null-safe)
+          const pce = stagingRec.getCellValue(S_PCE_BOX);
+          const sqm = stagingRec.getCellValue(S_SQM_BOX);
+          const kg = stagingRec.getCellValue(S_KG_BOX);
+          const bxP = stagingRec.getCellValue(S_BOX_PALLET);
+          const sqmP = stagingRec.getCellValue(S_SQM_PALLET);
+          const kgP = stagingRec.getCellValue(S_KG_PALLET);
+          
+          if (spdRec) {
+            if (pce !== null && !spdRec.getCellValue(SPD_PCE_BOX)) payload[SPD_PCE_BOX] = pce;
+            if (sqm !== null && !spdRec.getCellValue(SPD_SQM_BOX)) payload[SPD_SQM_BOX] = sqm;
+            if (kg !== null && !spdRec.getCellValue(SPD_KG_BOX)) payload[SPD_KG_BOX] = kg;
+            if (bxP !== null && !spdRec.getCellValue(SPD_BOX_PALLET)) payload[SPD_BOX_PALLET] = bxP;
+            if (sqmP !== null && !spdRec.getCellValue(SPD_SQM_PALLET)) payload[SPD_SQM_PALLET] = sqmP;
+            if (kgP !== null && !spdRec.getCellValue(SPD_KG_PALLET)) payload[SPD_KG_PALLET] = kgP;
+            
+            spdUpdates.push({ id: spdRec.id, fields: payload });
+          } else {
+            payload[SPD_SKU] = rawSku;
+            if (rawDesc) payload[SPD_DESC] = rawDesc;
+            if (pce !== null) payload[SPD_PCE_BOX] = pce;
+            if (sqm !== null) payload[SPD_SQM_BOX] = sqm;
+            if (kg !== null) payload[SPD_KG_BOX] = kg;
+            if (bxP !== null) payload[SPD_BOX_PALLET] = bxP;
+            if (sqmP !== null) payload[SPD_SQM_PALLET] = sqmP;
+            if (kgP !== null) payload[SPD_KG_PALLET] = kgP;
+            
+            spdCreates.push({ fields: payload });
+          }
+          
+        } else if (importType.toUpperCase().startsWith("EOR")) {
+          // ───── END OF RANGE LOGIC ─────
+          if (spdRec) {
+            const eorPayload = {};
+            const soh = stagingRec.getCellValue(S_SOH);
+            const sav = stagingRec.getCellValue(S_SAV);
+            const eorStock = stagingRec.getCellValue(S_EOR_STOCK);
+            
+            if (soh !== null) eorPayload[SPD_SOH] = soh;
+            if (sav !== null) eorPayload[SPD_SAV] = sav;
+            if (eorStock !== null) eorPayload[SPD_EOR_STOCK] = eorStock;
+            eorPayload[SPD_STOCK_UPDATE] = new Date().toISOString().split("T")[0];
+            eorPayload[SPD_STOCK_STATUS] = { name: "SPD EOR" };
+            
+            spdUpdates.push({ id: spdRec.id, fields: eorPayload });
+          }
+          
+        } else if (importType.toUpperCase().startsWith("DD")) {
+          // ───── DISCONTINUED LOGIC ─────
+          if (spdRec) {
+            const ddPayload = {};
+            const soh = stagingRec.getCellValue(S_SOH);
+            const sav = stagingRec.getCellValue(S_SAV);
+            
+            if (soh !== null) ddPayload[SPD_SOH] = soh;
+            if (sav !== null) ddPayload[SPD_SAV] = sav;
+            ddPayload[SPD_STOCK_UPDATE] = new Date().toISOString().split("T")[0];
+            ddPayload[SPD_STOCK_STATUS] = { name: "SPD DD" };
+            
+            spdUpdates.push({ id: spdRec.id, fields: ddPayload });
+          }
+        }
+        
+        stagingUpdates.push({
+          id: stagingRec.id,
+          fields: { [S_ETL_STATUS]: { name: "processed" } }
+        });
+        
+        procCount++;
+        
+      } catch (err) {
+        failCount++;
+        stagingUpdates.push({
+          id: stagingRec.id,
+          fields: { [S_ETL_STATUS]: { name: "failed" } }
+        });
+        
+        adminLogs_arr.push({
+          fields: {
+            [LOG_NOTES]: `Row **${rawSku}**: ${err.message}`,
+            [LOG_TYPE]: { name: "System_Event" },
+            [LOG_SEVERITY]: { name: "High" },
+            [LOG_STATUS]: { name: "Logged" }
+          }
+        });
+      }
+    }
+    
+    // ────────────────────────────────────────────────────────
+    // STEP 5 — Commit batches
+    // ────────────────────────────────────────────────────────
+    if (!DRY_RUN) {
+      output.markdown("## Step 4 — Writing to Airtable...");
+      
+      for (const b of chunk(spdCreates, 50)) {
+        await spdTable.createRecordsAsync(b);
+      }
+      for (const b of chunk(spdUpdates, 50)) {
+        await spdTable.updateRecordsAsync(b);
+      }
+      for (const b of chunk(stagingUpdates, 50)) {
+        await stagingTable.updateRecordsAsync(b);
+      }
+      for (const b of chunk(adminLogs_arr, 50)) {
+        await adminLogs.createRecordsAsync(b);
+      }
+    }
+    
+    output.markdown("---");
+    output.markdown("## ✅ Script 1 Complete");
+    output.markdown(
+      `| Metric | Count |\n|--------|-------|\n` +
+      `| Processed | ${procCount} |\n` +
+      `| Failed | ${failCount} |\n` +
+      `| SPD Created | ${spdCreates.length} |\n` +
+      `| SPD Updated | ${spdUpdates.length} |`
+    );
+    
+  } catch (err) {
+    output.markdown(`## ❌ Unhandled Error\n\`\`\`\n${err.message}\n\`\`\``);
+  }
+}
+
+await main();

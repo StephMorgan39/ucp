@@ -1,247 +1,246 @@
-// ============================================================
-// SCRIPT 0C — RELEASE RUNNER v2.0
-// Utile Solutions PIM | March 2026
-//
-// CHANGES FROM v1:
-//   ✅ Whitelist loaded dynamically from UtileStaff table
-//      (no hardcoded emails — add/remove staff in Airtable UI)
-//   ✅ No manual variables to toggle
-//   ✅ Aborts cleanly if UtileStaff is empty with clear instruction
-//
-// WHAT IT DOES:
-//   Releases Anomalies records that have been Approved by an
-//   authorised operator back into the Staging pipeline.
-//   Sets Staging row status back to PENDING so Script 1 can route it.
-// ============================================================
+/**
+ * SCRIPT 0A — RENAME DETECTOR v2.1
+ * Improvements: Error handling, output.markdown, graceful empty handling
+ */
 
-const ANOMALIES_TABLE_ID = "tbl56i9Rlm2mK6t1w";
-const STAFF_TABLE_ID = "tbliuiXOlUeat2meH";
+const FUZZY_THRESHOLD = 0.85;
+const ADMIN_LOGS_TABLE_ID = "tblk1v5VHPEC2c2u2";
+const SPD_TABLE_ID = "tbl7mZpHJCUs1r0cg";
+const PM_TABLE_ID = "tblgLqMMXX2HcKt9U";
 const STAGING_TABLE_ID = "tblcPSP5NcP0ioUP8";
-const LOG_TABLE_ID = "tblk1v5VHPEC2c2u2";
-const SUPPLIER_TABLE_ID = "tblLmsdwd3AGdLgwQ";
 
-// Anomalies field IDs — FIX: all were placeholder names, replaced with real schema IDs
-const ANOM_APPROVED_FID = "flddfVzPFP0NjYhVc"; // Approved (checkbox)
-const ANOM_APPROVED_BY_FID = "fld9k8zf6uwWNx9SO"; // APPROVED BY (singleCollaborator)
-const ANOM_RESOLUTION_FID = "fld4li4vcLn43h2N4"; // Resolution Status (singleSelect)
-const ANOM_SOURCE_RECORD_FID = "fldOWWLBzngArnoL9"; // Source Record (link to Staging proxy)
-const ANOM_ERROR_TYPE_FID = "fldjYiDzJmdYJp6uF";
-const ANOM_NOTES_FID = "fldB7o9RtnQPi4goY";
+const SPD_SKU_FID = "fldK3FyPA98F3smc9";
+const SPD_DESC_FID = "fldoROoSpEm5FuUnI";
+const SPD_PM_LINK_FID = "fldGxaIlPVor7QEwN";
 
-// Staging field IDs
-const STG_STATUS_FID = "fldbrUDvLv8OEnEqh"; // Sys Etl Process Status singleSelect
+const PM_SKU_MASTER_FID = "fldMfK3uyPnDbKONn";
+const PM_STATUS_FID = "flddq6S7409EBM71D";
 
-// UtileStaff field IDs — FIX: fldFullName was placeholder
-const STAFF_EMAIL_FID = "fldyZXYwrxOcCFCsO";
-const STAFF_NAME_FID = "fldGNYm19XawnzbgE"; // FIX: was fldFullName
+const STG_SUPPLIER_SKU_FID = "fldeEd9FiNq5AtGNk";
+const STG_DESC_FID = "fldkAm1iLOJJYmzmi";
+const STG_STATUS_FID = "fldbrUDvLv8OEnEqh";
+const STG_IMPORT_TYPE_FID = "fldjdRY1TAJypmcPF";
 
-// AdminLogs field IDs — FIX: all were placeholder names
-const LOG_NOTES_FID = "fld4l6AJhVNRzIaY8"; // Notes
-const LOG_SEVERITY_FID = "fldPdoc6JPYHV9gpb"; // Severity
-const LOG_TYPE_FID = "flda8oHUThBc1Kb7I"; // Anomaly Type
+const LOG_NOTES_FID = "fld4l6AJhVNRzIaY8";
+const LOG_SEVERITY_FID = "fldPdoc6JPYHV9gpb";
+const LOG_TYPE_FID = "flda8oHUThBc1Kb7I";
+
+// ────────────────────────────────────────────────────────
+// Levenshtein Similarity (0.0 to 1.0)
+// ────────────────────────────────────────────────────────
+function similarity(a, b) {
+  a = String(a).toLowerCase().trim();
+  b = String(b).toLowerCase().trim();
+  if (a === b) return 1.0;
+  const la = a.length, lb = b.length;
+  if (!la || !lb) return 0;
+  
+  const dp = Array.from({ length: la + 1 }, (_, i) =>
+    Array.from({ length: lb + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  
+  for (let i = 1; i <= la; i++) {
+    for (let j = 1; j <= lb; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return 1 - dp[la][lb] / Math.max(la, lb);
+}
+
+function normalise(desc) {
+  return String(desc)
+    .toLowerCase()
+    .replace(/\d+(\.\d+)?\s*mm/g, '') // Strip dimensions
+    .replace(/\d+x\d+/g, '') // Strip WxH
+    .replace(/[^a-z\s]/g, ' ') // Strip non-alpha
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 async function main() {
-  output.markdown("# Script 0C — Release Runner v2.0");
-
-  // ── Step 0: Load authorised staff list ──────────────────
-  output.markdown("## Loading authorised staff list from UtileStaff...");
-  const staffTable = base.getTable(STAFF_TABLE_ID);
-  const staffQ = await staffTable.selectRecordsAsync({
-    fields: [STAFF_EMAIL_FID, STAFF_NAME_FID],
-  });
-
-  const whitelist = staffQ.records
-    .map((r) => r.getCellValueAsString(STAFF_EMAIL_FID).trim().toLowerCase())
-    .filter((e) => e.length > 4 && e.includes("@"));
-
-  if (!whitelist.length) {
-    output.markdown(
-      "## ❌ Cannot proceed — UtileStaff table has no email records.",
-    );
-    output.markdown(
-      "**Action required:** Add at least one staff record to the **UtileStaff** table with a valid email address.\n\n" +
-        "Go to: UtileStaff table → New record → Fill in `full_name` and `email` → Save.\n\n" +
-        "Then re-run this script.",
-    );
-    return;
-  }
-  output.markdown(`✅ ${whitelist.length} authorised staff email(s) loaded.`);
-
-  // ── Step 1: Identify current user ───────────────────────
-  // Airtable doesn't expose session user email in scripting API.
-  // We ask Nina to confirm her email — it's validated against whitelist.
-  const operatorEmail = await input.textAsync(
-    "Enter your email address to authorise release:",
-  );
-  const normEmail = operatorEmail.trim().toLowerCase();
-
-  if (!whitelist.includes(normEmail)) {
-    output.markdown(`## ❌ Authorisation failed`);
-    output.markdown(
-      `"${normEmail}" is not on the authorised list.\n\n` +
-        `Authorised accounts: ${whitelist.join(", ")}\n\n` +
-        `Contact your system administrator to be added to UtileStaff.`,
-    );
-    return;
-  }
-  output.markdown(`✅ Authorised: ${normEmail}`);
-
-  // ── Step 2: Load approved Anomalies ─────────────────────
-  output.markdown("## Step 2 — Loading approved anomalies...");
-  const anomTable = base.getTable(ANOMALIES_TABLE_ID);
-  const anomQ = await anomTable.selectRecordsAsync({
-    fields: [
-      ANOM_APPROVED_FID,
-      ANOM_APPROVED_BY_FID,
-      ANOM_RESOLUTION_FID,
-      ANOM_SOURCE_RECORD_FID,
-      ANOM_ERROR_TYPE_FID,
-      ANOM_NOTES_FID,
-    ],
-  });
-
-  const approved = anomQ.records.filter((r) => {
-    const isApproved = r.getCellValue(ANOM_APPROVED_FID) === true;
-    const resolution = r.getCellValueAsString(ANOM_RESOLUTION_FID).trim();
-    return isApproved && resolution !== "Resolved";
-  });
-
-  output.markdown(
-    `Approved anomalies awaiting release: **${approved.length}**`,
-  );
-  if (!approved.length) {
-    output.markdown(
-      "✅ Nothing to release. Check the Anomalies table — tick 'Approved' on records you want to release, then re-run.",
-    );
-    return;
-  }
-
-  // ── Step 3: Preview ─────────────────────────────────────
-  output.markdown("## Step 3 — Preview of records to be released:");
-  approved.forEach((r) => {
-    const errorType = r.getCellValueAsString(ANOM_ERROR_TYPE_FID);
-    const notes = r.getCellValueAsString(ANOM_NOTES_FID).substring(0, 120);
-    output.markdown(`- **${errorType}** | ${notes}...`);
-  });
-
-  const confirm = await input.buttonsAsync(
-    `Release ${approved.length} approved anomalies back into the pipeline?`,
-    [
-      { label: "✅ Release", variant: "primary" },
-      { label: "❌ Cancel", variant: "danger" },
-    ],
-  );
-  if (confirm !== "✅ Release") {
-    output.markdown("❌ Cancelled. No changes made.");
-    return;
-  }
-
-  // ── Step 4: Update Anomalies status to Resolved ─────────
-  output.markdown("## Step 4 — Marking anomalies as resolved...");
-  const anomUpdates = approved.map((r) => ({
-    id: r.id,
-    fields: { [ANOM_RESOLUTION_FID]: { name: "Resolved" } },
-  }));
-  for (let i = 0; i < anomUpdates.length; i += 50) {
-    await anomTable.updateRecordsAsync(anomUpdates.slice(i, i + 50));
-  }
-  output.markdown(`✅ ${anomUpdates.length} anomaly records marked Resolved.`);
-
-  // ── Step 5: Auto-Release Linked Staging Rows ─────────────────
-  output.markdown("## Step 5 — Automatically Releasing Staging Rows...");
-
+  output.markdown("# 🔍 Script 0A — Rename Detector v2.1");
+  
   const stagingTable = base.getTable(STAGING_TABLE_ID);
-  const stgQuery = await stagingTable.selectRecordsAsync({
-    fields: ["fldeEd9FiNq5AtGNk", "fldbrUDvLv8OEnEqh"], // Supplier SKU and Status
-  });
-
-  // Extract the SKUs from the approved Anomalies (Original Value field)
-  const approvedSkus = approved
-    .map((r) => {
-      const val = r.getCellValueAsString("fld0wlmRbNFgVpbXS");
-      return val ? val.trim().toUpperCase() : null;
-    })
-    .filter(Boolean);
-
-  const stagingUpdates = [];
-  for (const stgRec of stgQuery.records) {
-    const status = stgRec.getCellValueAsString("fldbrUDvLv8OEnEqh");
-    const sku = stgRec
-      .getCellValueAsString("fldeEd9FiNq5AtGNk")
-      .trim()
-      .toUpperCase();
-
-    // If the row was held by Script 0B and matches an approved anomaly, release it
-    const alreadyReleased = new Set();
-    if (
-      status === "pending_review" &&
-      approvedSkus.includes(sku) &&
-      !alreadyReleased.has(sku)
-    ) {
-      alreadyReleased.add(sku);
-      stagingUpdates.push({
-        id: stgRec.id,
-        fields: { fldbrUDvLv8OEnEqh: { name: "pending" } },
+  const spdTable = base.getTable(SPD_TABLE_ID);
+  const pmTable = base.getTable(PM_TABLE_ID);
+  const logTable = base.getTable(ADMIN_LOGS_TABLE_ID);
+  
+  try {
+    // ────────────────────────────────────────────────────────
+    // STEP 1 — Load pending Staging rows
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 1 — Loading pending Staging records...");
+    
+    const stagingQ = await stagingTable.selectRecordsAsync({
+      fields: [STG_SUPPLIER_SKU_FID, STG_DESC_FID, STG_STATUS_FID, STG_IMPORT_TYPE_FID]
+    });
+    
+    const pendingRows = stagingQ.records.filter((r) => {
+      const status = r.getCellValueAsString(STG_STATUS_FID).trim().toUpperCase();
+      const type = r.getCellValueAsString(STG_IMPORT_TYPE_FID).trim().toUpperCase();
+      return status === "PENDING" && type === "ST"; // Stock Transfer only
+    });
+    
+    output.markdown(`✅ Found **${pendingRows.length}** pending ST records`);
+    
+    if (pendingRows.length === 0) {
+      output.markdown("No records to process. Exiting.");
+      return;
+    }
+    
+    // ────────────────────────────────────────────────────────
+    // STEP 2 — Load SPD index
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 2 — Loading SPD index...");
+    
+    const spdQ = await spdTable.selectRecordsAsync({
+      fields: [SPD_SKU_FID, SPD_DESC_FID, SPD_PM_LINK_FID]
+    });
+    
+    const spdBySkuUpper = new Map();
+    const spdByNormDesc = new Map();
+    
+    for (const r of spdQ.records) {
+      const sku = r.getCellValueAsString(SPD_SKU_FID).trim().toUpperCase();
+      const desc = r.getCellValueAsString(SPD_DESC_FID).trim();
+      
+      if (sku) spdBySkuUpper.set(sku, r);
+      if (desc.length >= 5) spdByNormDesc.set(normalise(desc), r);
+    }
+    
+    output.markdown(`✅ Indexed **${spdBySkuUpper.size}** SPD SKUs, **${spdByNormDesc.size}** descriptions`);
+    
+    // ────────────────────────────────────────────────────────
+    // STEP 3 — Load active PM SKUs for validation
+    // ────────────────────────────────────────────────────────
+    const pmQ = await pmTable.selectRecordsAsync({
+      fields: [PM_SKU_MASTER_FID, PM_STATUS_FID]
+    });
+    
+    const activePmSkus = new Set(
+      pmQ.records
+        .filter((r) => {
+          const status = r.getCellValueAsString(PM_STATUS_FID).trim();
+          return ["ACTIVE", "PM ACTIVE", "NEW PRODUCTS", "PM NEW", "SKU_Transition"].includes(status);
+        })
+        .map((r) => r.getCellValueAsString(PM_SKU_MASTER_FID).trim().toUpperCase())
+    );
+    
+    output.markdown(`✅ Loaded **${activePmSkus.size}** active PM SKUs`);
+    
+    // ────────────────────────────────────────────────────────
+    // STEP 4 — Detect renames
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 3 — Detecting SKU renames...");
+    
+    const logs = [];
+    let type1Count = 0, type2Count = 0;
+    
+    // TYPE 1 — Batch Variant (.A suffix)
+    const dotARows = pendingRows.filter((r) =>
+      r.getCellValueAsString(STG_SUPPLIER_SKU_FID).trim().toUpperCase().endsWith(".A")
+    );
+    
+    const baseSkuMap = new Map();
+    for (const r of pendingRows) {
+      const sku = r.getCellValueAsString(STG_SUPPLIER_SKU_FID).trim().toUpperCase();
+      if (!sku.endsWith(".A")) baseSkuMap.set(sku, r);
+    }
+    
+    for (const dotARow of dotARows) {
+      const rawSku = dotARow.getCellValueAsString(STG_SUPPLIER_SKU_FID).trim().toUpperCase();
+      const baseSku = rawSku.slice(0, -2);
+      const hasPair = baseSkuMap.has(baseSku);
+      
+      output.markdown(`- \`${rawSku}\` → base \`${baseSku}\` ${hasPair ? "✅" : "⏳ deferred"}`);
+      
+      logs.push({
+        fields: {
+          [LOG_TYPE_FID]: { name: "System_Event" },
+          [LOG_SEVERITY_FID]: { name: "Info" },
+          [LOG_NOTES_FID]: `TYPE 1 Batch Variant: ${rawSku} (pair: ${hasPair ? "yes" : "no"})`
+        }
       });
+      type1Count++;
     }
-  }
-
-  if (stagingUpdates.length > 0) {
-    for (let i = 0; i < stagingUpdates.length; i += 50) {
-      await stagingTable.updateRecordsAsync(stagingUpdates.slice(i, i + 50));
+    
+    // TYPE 2 — Plain Whammy (fuzzy match)
+    for (const row of pendingRows) {
+      const rawSku = row.getCellValueAsString(STG_SUPPLIER_SKU_FID).trim().toUpperCase();
+      const rawDesc = row.getCellValueAsString(STG_DESC_FID).trim();
+      
+      if (rawSku.endsWith(".A")) continue; // Skip .A rows
+      if (spdBySkuUpper.has(rawSku)) continue; // Skip known SKUs
+      
+      const normIncoming = normalise(rawDesc);
+      if (normIncoming.length < 5) continue; // Skip too-short descriptions
+      
+      let bestScore = 0, bestSpdRec = null;
+      for (const [normDesc, spdRec] of spdByNormDesc.entries()) {
+        const score = similarity(normIncoming, normDesc);
+        if (score > bestScore) {
+          bestScore = score;
+          bestSpdRec = spdRec;
+        }
+      }
+      
+      if (bestScore >= FUZZY_THRESHOLD && bestSpdRec) {
+        const matchSku = bestSpdRec.getCellValueAsString(SPD_SKU_FID);
+        
+        output.markdown(
+          `- **NEW** \`${rawSku}\` ≈ **EXISTING** \`${matchSku}\` (${(bestScore * 100).toFixed(0)}%)`
+        );
+        
+        logs.push({
+          fields: {
+            [LOG_TYPE_FID]: { name: "System_Event" },
+            [LOG_SEVERITY_FID]: { name: "Info" },
+            [LOG_NOTES_FID]: `TYPE 2 Plain Whammy: ${rawSku} matches ${matchSku} (${(bestScore * 100).toFixed(0)}%)`
+          }
+        });
+        type2Count++;
+      }
     }
+    
+    // ────────────────────────────────────────────────────────
+    // STEP 5 — Write logs
+    // ────────────────────────────────────────────────────────
+    output.markdown("## Step 4 — Writing detection logs...");
+    
+    if (logs.length > 0) {
+      for (let i = 0; i < logs.length; i += 50) {
+        await logTable.createRecordsAsync(logs.slice(i, i + 50));
+      }
+      output.markdown(`✅ Logged **${logs.length}** detection events`);
+    }
+    
+    output.markdown("---");
+    output.markdown("## ✅ Script 0A Complete");
     output.markdown(
-      `✅ Successfully released **${stagingUpdates.length}** Staging rows back to PENDING.`,
+      `| Type | Count |\n|------|-------|\n` +
+      `| TYPE 1 (Batch .A) | ${type1Count} |\n` +
+      `| TYPE 2 (Whammy) | ${type2Count} |`
     );
-  } else {
-    output.markdown(
-      `ℹ️ No matching Staging rows found in 'pending_review' state.`,
-    );
+    
+  } catch (err) {
+    output.markdown(`## ❌ Error: ${err.message}`);
+    await logEvent(logTable, "SCRIPT_0A_ERROR", err.message, "High");
   }
+}
 
-  // ── Step 6: Log ─────────────────────────────────────────
-  // Redundant Supplier table query completely removed to improve script speed
-  await logTable.createRecordsAsync([
-    {
+async function logEvent(logTable, type, notes, severity) {
+  try {
+    await logTable.createRecordAsync({
       fields: {
-        [LOG_NOTES_FID]:
-          `Script 0C Release Runner executed.\n` +
-          `Operator: ${normEmail}\n` +
-          `Anomalies released: ${approved.length}\n` +
-          `Records marked Resolved: ${anomUpdates.length}`,
-        [LOG_SEVERITY_FID]: { name: "Info" },
-        [LOG_TYPE_FID]: {
-          name: "System_Event (A catch-all for scripts starting/finishing)",
-        }, // Using the exact schema string
-        fldog9l4DwJeE5Qj8: {
-          name: 'Logged (The default for all "Info" scripts)',
-        }, // Using the exact schema string
-        fldyYs6l736JsE2iJ: normEmail,
-      },
-    },
-
-    {
-      fields: {
-        [LOG_NOTES_FID]:
-          `Script 0C Release Runner executed.\n` +
-          `Operator: ${normEmail}\n` +
-          `Anomalies released: ${approved.length}\n` +
-          `Records marked Resolved: ${anomUpdates.length}`,
-        [LOG_SEVERITY_FID]: { name: "System_Event " },
-        [LOG_TYPE_FID]: { name: "System_Event" }, // closest available type for release events
-        fldog9l4DwJeE5Qj8: { name: "Logged" }, // Setting new System Log status
-        fldyYs6l736JsE2iJ: normEmail, // Writing to the new Operator Email field
-      },
-    },
-  ]);
-
-  output.markdown("---");
-  output.markdown("## ✅ Release complete");
-  output.markdown(`- Operator: **${normEmail}**`);
-  output.markdown(`- Anomalies resolved: **${approved.length}**`);
-  output.markdown(
-    `- Next step: Set released Staging rows back to PENDING, then run Script 1.`,
-  );
+        [LOG_NOTES_FID]: notes.substring(0, 5000),
+        [LOG_TYPE_FID]: { name: "System_Event" },
+        [LOG_SEVERITY_FID]: { name: severity },
+        "fldog9l4DwJeE5Qj8": { name: "Logged" }
+      }
+    });
+  } catch (e) { /* Silent fail */ }
 }
 
 await main();
