@@ -6,3 +6,5 @@ npm-debug.log*
 __pycache__/
 .venv/
 repomix-output.txt
+docs/
+src/routes/lm3.js

@@ -50,8 +50,6 @@ const STG_IMPORT_TYPE_FID = "fldjdRY1TAJypmcPF";
 const LOG_NOTES_FID = "fld4l6AJhVNRzIaY8"; // Notes
 const LOG_SEVERITY_FID = "fldPdoc6JPYHV9gpb"; // Severity
 const LOG_TYPE_FID = "flda8oHUThBc1Kb7I"; // Anomaly Type
-const LOG_SUPPLIER_FID = "fldpY3ETXowLbhQDw"; // Link to Supplier
-const LOG_DETECTED_FID = "fldILG5KBZqYIZx2v"; // Detected Value
 
 // ── Levenshtein similarity ──────────────────────────────────
 function similarity(a, b) {
@@ -170,10 +168,13 @@ async function main() {
 
     logs.push({
       fields: {
-        [LOG_TYPE_FID]: { name: "Rename_Detected" },
-        [LOG_SEVERITY_FID]: { name: "Info" },
-        [LOG_NOTES_FID]: `TYPE 1 Batch Variant detected.\nDot-A SKU: ${rawSku}\nBase SKU: ${baseSku}\nPair in batch: ${hasPair ? "YES" : "NO — will resolve on depletion"}`,
-        [LOG_DETECTED_FID]: rawSku,
+        [LOG_TYPE_FID]: {
+          name: "System_Event (A catch-all for scripts starting/finishing)",
+        }, // Updated to exact schema string
+        [LOG_SEVERITY_FID]: {
+          name: "Info",
+        },
+        [LOG_NOTES_FID]: `TYPE 1 Batch Variant detected.\nDot-A SKU: ${rawSku}\nBase SKU: ${baseSku}\nPair in batch: ${hasPair ? "YES" : "NO — will resolve on depletion"}\nDetected: ${rawSku}`,
       },
     });
     type1Count++;
@@ -239,7 +240,9 @@ async function main() {
 
       logs.push({
         fields: {
-          [LOG_TYPE_FID]: { name: "Rename_Detected" },
+          [LOG_TYPE_FID]: {
+            name: "System_Event (A catch-all for scripts starting/finishing)",
+          }, // Updated to match the new catch-all schema option
           [LOG_SEVERITY_FID]: { name: "Info" },
           [LOG_NOTES_FID]:
             `TYPE 2 Plain Whammy detected.\n` +
@@ -247,8 +250,9 @@ async function main() {
             `MATCHED existing SPD SKU: ${matchedSku}\n` +
             `Match score: ${(bestScore * 100).toFixed(1)}%\n` +
             `ACTION: Old SPD record → Z suffix on PLU. New record → B suffix on PLU.\n` +
-            `Script 1 will handle routing. Script 2 will handle transition.`,
-          [LOG_DETECTED_FID]: `${rawSku} ≈ ${matchedSku} (${(bestScore * 100).toFixed(0)}%)`,
+            `Script 1 will handle routing. Script 2 will handle transition.\n` +
+            `Detected Match: ${rawSku} ≈ ${matchedSku} (${(bestScore * 100).toFixed(0)}%)`,
+          // LOG_DETECTED_FID removed to prevent crash
         },
       });
       type2Count++;
@@ -257,24 +261,12 @@ async function main() {
 
   // ── Write logs ──────────────────────────────────────────
   if (logs.length) {
-    // Get supplier link for log records (use first Decobella record)
-    const supplierQ = await base
-      .getTable(SUPPLIER_TABLE_ID)
-      .selectRecordsAsync({ fields: ["Field Id"] });
-    const supplierRecord = supplierQ.records[0];
-
-    const logsWithSupplier = logs.map((l) => ({
-      fields: {
-        ...l.fields,
-        ...(supplierRecord
-          ? { [LOG_SUPPLIER_FID]: [{ id: supplierRecord.id }] }
-          : {}),
-      },
-    }));
-
-    // Batch create in chunks of 50
-    for (let i = 0; i < logsWithSupplier.length; i += 50) {
-      await logTable.createRecordsAsync(logsWithSupplier.slice(i, i + 50));
+    // ── Write logs ──────────────────────────────────────────
+    if (logs.length) {
+      // Supplier link dependency completely removed to improve runtime performance
+      for (let i = 0; i < logs.length; i += 50) {
+        await logTable.createRecordsAsync(logs.slice(i, i + 50));
+      }
     }
   }
 
