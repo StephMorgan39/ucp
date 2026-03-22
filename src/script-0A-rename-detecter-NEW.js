@@ -169,7 +169,7 @@ async function main() {
     logs.push({
       fields: {
         [LOG_TYPE_FID]: {
-          name: "System_Event (A catch-all for scripts starting/finishing)",
+          name: "System_Event",
         }, // Updated to exact schema string
         [LOG_SEVERITY_FID]: {
           name: "Info",
@@ -241,7 +241,7 @@ async function main() {
       logs.push({
         fields: {
           [LOG_TYPE_FID]: {
-            name: "System_Event (A catch-all for scripts starting/finishing)",
+            name: "System_Event",
           }, // Updated to match the new catch-all schema option
           [LOG_SEVERITY_FID]: { name: "Info" },
           [LOG_NOTES_FID]:
