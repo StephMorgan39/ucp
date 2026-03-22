@@ -8,8 +8,8 @@ const LEGACY_CODES_ID = "tbl8c8q0Bd33XCJCG";
 
 // SystemBuildLogs Fields
 const LOG_EVENT_NAME_FLD = "flda8oHUThBc1Kb7I";
-const LOG_NOTES_FLD = "fldESMffFnUZNRhd2";
-const LOG_STATUS_FLD = "fldt4He3EKXqhfuu2";
+const LOG_NOTES_FLD = "fld4l6AJhVNRzIaY8";
+const LOG_STATUS_FLD = "fldog9l4DwJeE5Qj8";
 
 async function migrateRogueRecord() {
   let activeId = cursor.activeTableId;
