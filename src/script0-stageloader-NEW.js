@@ -168,6 +168,32 @@ async function main() {
       `Delimiter detected: ${delimiter === ";" ? "semicolon (;)" : "comma (,)"}`,
     );
 
+    // --- GENCODE SANITISATION (Decobella Excel coercion guard) ---
+// Fixes two known Excel type-coercion patterns on Decobella stocklist uploads.
+// Logs to SystemLogs whenever a correction fires so Nina has an audit trail.
+
+const GENCODE_COERCION_WATCH = {
+    "3":      "0003",   // Excel stripped leading zeros
+    "2001-1": "0001-1"  // Excel date-coerced: year 2001, month 1
+};
+
+function sanitiseGencode(raw) {
+    if (!raw) return null;
+    const s = raw.toString().trim();
+
+    // Check known coercion cases first
+    if (GENCODE_COERCION_WATCH[s]) return GENCODE_COERCION_WATCH[s];
+
+    // General rule: pure 1-4 digit number → pad to 4 digits
+    if (/^\d{1,4}$/.test(s)) return s.padStart(4, "0");
+
+    // General rule: 2XXX-N date coercion pattern → 0XXX-N
+    const dateCoerce = s.match(/^2(\d{3})-(\d{1,2})$/);
+    if (dateCoerce) return `0${dateCoerce[1]}-${dateCoerce[2]}`;
+
+    return s;
+}
+
     // ── Parse CSV (handles quoted fields, embedded newlines, \r\n)
     const rows = [];
     let row = [],
@@ -209,6 +235,23 @@ async function main() {
       });
       return;
     }
+
+    if (GENCODE_COERCION_WATCH[rawGencode]) {
+      infoLogBatch.push({
+          fields: {
+              fld4l6AJhVNRzIaY8:
+                  `⚠️ GENCODE auto-corrected on import\n\n` +
+                  `Original value in file: "${rawGencode}"\n` +
+                  `Corrected to: "${gencode}"\n\n` +
+                  `This is a known Excel formatting issue with the Decobella stocklist. ` +
+                  `The correction has been applied automatically. No action required.`,
+              flda8oHUThBc1Kb7I: { name: "System_Event" },
+              fldPdoc6JPYHV9gpb: { name: "Info" },
+              fldog9l4DwJeE5Qj8: { name: "Logged" },
+              fldJ1v4BeTILLN37J: true, // auto-reviewed, informational only
+          },
+      });
+  }
 
     const headers = rows[0].map((h) => h.trim().toUpperCase());
     log(

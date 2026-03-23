@@ -1,11 +1,19 @@
 /**
- * SCRIPT 0B — VALIDATION GATE v1.3
+ * SCRIPT 0B — VALIDATION GATE v1.4
  * Utile PIM | Base: appefUQrLFZYN4Y5t
  *
- * DESIGN PRINCIPLE (v1.3):
- *   UPCAdmin = things Nina MUST approve before import can proceed.
+ * DESIGN PRINCIPLE (v1.4):
+ *   UPCAdmin   = things Nina MUST approve before import can proceed.
  *   SystemLogs = everything else — informational, auto-resolved, new products.
  *   Nina reviews UPCAdmin only. She sees the rest in System Activity after the fact.
+ *
+ * WHAT CHANGED IN v1.4 (vs v1.3):
+ *   1. UPCAdmin Resolution Status "Open" → "Unresolved" (schema fix — silent drop in v1.3)
+ *   2. UPCAdmin Flag Severity emoji string → plain "Critical" / "High" (schema fix — silent drop in v1.3)
+ *   3. SystemLogs System Log status in error handler "Open" → "Error" (schema consistency fix)
+ *   4. holdCorrespondence index bug fixed — syslogIndex now captured immediately before push,
+ *      and cross-link only registered when a companion syslog is actually created
+ *   5. Bidirectional cross-link: SystemLog → UPCAdmin AND UPCAdmin → SystemLog (Activity field)
  *
  * RULES:
  *   R1 — Price change DURING active A+Z transition  → HOLD (UPCAdmin) — margin risk
@@ -25,28 +33,22 @@
 // LOG HELPER — works in both script UI and automation mode
 // ─────────────────────────────────────────────────────────
 const log = (msg) => {
-  try {
-    output.markdown(msg);
-  } catch (_) {}
-  console.log(
-    String(msg).replace(/\*\*/g, "").replace(/`/g, "").replace(/#+\s/g, ""),
-  );
+  try { output.markdown(msg); } catch (_) {}
+  console.log(String(msg).replace(/\*\*/g, "").replace(/`/g, "").replace(/#+\s/g, ""));
 };
 
 async function main() {
-  log("# 🛡️ Script 0B — Validation Gate v1.3");
+  log("# 🛡️ Script 0B — Validation Gate v1.4");
   log(`> Running at: \`${new Date().toLocaleString()}\``);
-  log(
-    "> Gate: only holds things Nina must approve. Everything else logs and flows.",
-  );
+  log("> Gate: only holds things Nina must approve. Everything else logs and flows.");
   log("---");
 
   const stagingTable = base.getTable("tblcPSP5NcP0ioUP8");
-  const spdTable = base.getTable("tbl7mZpHJCUs1r0cg");
-  const pbTable = base.getTable("tblW85ycReRUr0Ze1");
-  const pmTable = base.getTable("tblgLqMMXX2HcKt9U");
-  const anomTable = base.getTable("tbl56i9Rlm2mK6t1w");
-  const adminLogs = base.getTable("tblk1v5VHPEC2c2u2");
+  const spdTable     = base.getTable("tbl7mZpHJCUs1r0cg");
+  const pbTable      = base.getTable("tblW85ycReRUr0Ze1");
+  const pmTable      = base.getTable("tblgLqMMXX2HcKt9U");
+  const anomTable    = base.getTable("tbl56i9Rlm2mK6t1w"); // UPCAdmin
+  const adminLogs    = base.getTable("tblk1v5VHPEC2c2u2"); // SystemLogs
 
   // ──────────────────────────────────────────────────────
   // STEP 1 — Load pending Staging records
@@ -93,10 +95,7 @@ async function main() {
   });
   const spdIndex = {};
   for (const rec of spdQuery.records) {
-    const key = rec
-      .getCellValueAsString("fldmeU6JZIwvGAuRH")
-      .trim()
-      .toUpperCase();
+    const key = rec.getCellValueAsString("fldmeU6JZIwvGAuRH").trim().toUpperCase();
     if (key) spdIndex[key] = rec;
   }
 
@@ -127,8 +126,8 @@ async function main() {
   const pbCostIndex = {};
   for (const rec of pbQuery.records) {
     const pmLinks = rec.getCellValue("fldAYj8E8RicN1EmL") || [];
-    const pt = rec.getCellValueAsString("fldlCCMJvTDaNin4h").toLowerCase();
-    const cost = rec.getCellValue("fldxf21wIe7LXyHFz");
+    const pt      = rec.getCellValueAsString("fldlCCMJvTDaNin4h").toLowerCase();
+    const cost    = rec.getCellValue("fldxf21wIe7LXyHFz");
     if (pmLinks.length > 0 && pt && cost !== null) {
       pbCostIndex[`${pmLinks[0].id}|${pt}`] = cost;
     }
@@ -136,15 +135,12 @@ async function main() {
 
   log(
     `✅ Indexed: **${Object.keys(spdIndex).length}** SPD | ` +
-      `**${Object.keys(pbCostIndex).length}** PricingBridge | ` +
-      `**${Object.keys(pmIndex).length}** PM`,
+    `**${Object.keys(pbCostIndex).length}** PricingBridge | ` +
+    `**${Object.keys(pmIndex).length}** PM`,
   );
 
   const normSku = (s) =>
-    String(s || "")
-      .replace(/[-\s]/g, "")
-      .trim()
-      .toUpperCase();
+    String(s || "").replace(/[-\s]/g, "").trim().toUpperCase();
 
   // ──────────────────────────────────────────────────────
   // STEP 3 — Run validation rules
@@ -158,63 +154,53 @@ async function main() {
     return o;
   };
 
-  const stagingUpdates = [];
-  const anomCreates = [];
-  const infoLogBatch = [];
+  const stagingUpdates  = [];
+  const anomCreates     = [];
+  const infoLogBatch    = [];
+
+  // Each entry: { anomIndex, syslogIndex }
+  // Only populated when a hold AND a companion syslog exist for the same SKU.
   const holdCorrespondence = [];
 
-  let countClean = 0,
-    countHeld = 0,
-    countInfoLogged = 0;
+  let countClean = 0, countHeld = 0, countInfoLogged = 0;
 
   for (const stagingRec of pendingRecords) {
-    const rawSku = stagingRec.getCellValueAsString("fldeEd9FiNq5AtGNk").trim();
-    const normKey = normSku(rawSku);
+    const rawSku     = stagingRec.getCellValueAsString("fldeEd9FiNq5AtGNk").trim();
+    const normKey    = normSku(rawSku);
     const importType = stagingRec.getCellValueAsString("fldjdRY1TAJypmcPF");
 
-    const spdRec = spdIndex[normKey] || null;
-    const pmLinks = spdRec
-      ? spdRec.getCellValue("fldGxaIlPVor7QEwN") || []
-      : [];
-    const pmId = pmLinks.length > 0 ? pmLinks[0].id : null;
-    const pmData = pmId ? pmIndex[pmId] : null;
+    const spdRec  = spdIndex[normKey] || null;
+    const pmLinks = spdRec ? spdRec.getCellValue("fldGxaIlPVor7QEwN") || [] : [];
+    const pmId    = pmLinks.length > 0 ? pmLinks[0].id : null;
+    const pmData  = pmId ? pmIndex[pmId] : null;
     const inZWindow = pmData ? pmData.hasActiveZPair : false;
 
-    const holds = []; // → UPCAdmin, blocks record
+    const holds    = []; // → UPCAdmin, blocks record
     const infoLogs = []; // → SystemLogs only, record flows
 
     // ── R1 — Price change ─────────────────────────────────
     if (importType.startsWith("PR") && pmId) {
-      const incoming = stagingRec.getCellValue("fldHDkQCH8jKeJZ7g");
+      const incoming  = stagingRec.getCellValue("fldHDkQCH8jKeJZ7g");
       const lastKnown = pbCostIndex[`${pmId}|standard`];
 
-      if (
-        lastKnown !== undefined &&
-        incoming !== null &&
-        Math.abs(incoming - lastKnown) > 0
-      ) {
-        const pct =
-          lastKnown !== 0
-            ? (((incoming - lastKnown) / lastKnown) * 100).toFixed(1)
-            : "N/A";
+      if (lastKnown !== undefined && incoming !== null && Math.abs(incoming - lastKnown) > 0) {
+        const pct       = lastKnown !== 0 ? (((incoming - lastKnown) / lastKnown) * 100).toFixed(1) : "N/A";
         const direction = incoming > lastKnown ? "▲ increase" : "▼ decrease";
-        const detail =
+        const detail    =
           `Price ${direction} | SKU: ${rawSku}\n` +
           `Previous: R${lastKnown} → Incoming: R${incoming} (${pct}%)`;
 
         if (inZWindow) {
-          // Mid-transition — margin risk → HOLD
           holds.push({
             errorType: "Price_Spike",
-            severity: "Critical",
-            label: "Price Change During Code Transition — Hold for Review",
+            severity:  "Critical",
+            label:     "Price Change During Code Transition — Hold for Review",
             detail:
               detail +
               "\nThis SKU is mid-transition (old and new code both active). " +
               "A price change here carries margin risk. Review before releasing.",
           });
         } else {
-          // Normal price update → log only, flows through
           infoLogs.push(`Price update: ${rawSku} | ${detail}`);
         }
       }
@@ -226,8 +212,8 @@ async function main() {
       if (incoming !== null && incoming <= 0) {
         holds.push({
           errorType: "Zero_Price",
-          severity: "Critical",
-          label: "Zero or Negative Price — Data Error in Supplier File",
+          severity:  "Critical",
+          label:     "Zero or Negative Price — Data Error in Supplier File",
           detail:
             `SKU: ${rawSku} | Incoming price: R${incoming}\n` +
             `A price of zero or less is not valid. Check the supplier file for this SKU.`,
@@ -240,29 +226,22 @@ async function main() {
 
     // ── R4 — Description drift → INFO only, flows ────────
     if (spdRec) {
-      const incoming = stagingRec
-        .getCellValueAsString("fldkAm1iLOJJYmzmi")
-        .trim()
-        .toUpperCase();
-      const existing = spdRec
-        .getCellValueAsString("fldoROoSpEm5FuUnI")
-        .trim()
-        .toUpperCase();
+      const incoming = stagingRec.getCellValueAsString("fldkAm1iLOJJYmzmi").trim().toUpperCase();
+      const existing = spdRec.getCellValueAsString("fldoROoSpEm5FuUnI").trim().toUpperCase();
       if (incoming && existing && incoming !== existing) {
         infoLogs.push(
           `Description change: ${rawSku}\n` +
-            `  Was: "${existing.substring(0, 100)}"\n` +
-            `  Now: "${incoming.substring(0, 100)}"\n` +
-            `  Script 1 will update SPD null-safe.`,
+          `  Was: "${existing.substring(0, 100)}"\n` +
+          `  Now: "${incoming.substring(0, 100)}"\n` +
+          `  Script 1 will update SPD null-safe.`,
         );
       }
     }
 
     // ── R5 — Lifecycle change during A+Z → INFO only ─────
     if (pmId && inZWindow) {
-      const isDiscontinued =
-        stagingRec.getCellValue("fld86PlXSbmJlrx8N") === true;
-      const isEOR = stagingRec.getCellValue("fldE3iZL2T294su95") === true;
+      const isDiscontinued = stagingRec.getCellValue("fld86PlXSbmJlrx8N") === true;
+      const isEOR          = stagingRec.getCellValue("fldE3iZL2T294su95") === true;
       if (isDiscontinued || isEOR) {
         const signal = isDiscontinued ? "Discontinued" : "End of Range";
         infoLogs.push(
@@ -272,15 +251,14 @@ async function main() {
     }
 
     // ── R8 — EOR with no stock figure at all → HOLD ───────
-    // Zero is valid. Null on BOTH fields = column missing from file = data error.
     if (importType.startsWith("EOR")) {
       const eorStock = stagingRec.getCellValue("fld4WI1P7S1cGxoyo");
-      const soh = stagingRec.getCellValue("fldhNujCBWdylBEzS");
+      const soh      = stagingRec.getCellValue("fldhNujCBWdylBEzS");
       if (eorStock === null && soh === null) {
         holds.push({
           errorType: "Missing_Data",
-          severity: "Critical",
-          label: "End of Range Record Has No Stock Quantity",
+          severity:  "Critical",
+          label:     "End of Range Record Has No Stock Quantity",
           detail:
             `SKU: ${rawSku}\n` +
             `Both Stock On Hand and EOR Stock are empty — the stock column appears to be missing from the file.\n` +
@@ -296,11 +274,7 @@ async function main() {
 
       stagingUpdates.push({
         id: stagingRec.id,
-        fields: {
-          fldbrUDvLv8OEnEqh: {
-            name: "pending_review",
-          },
-        },
+        fields: { fldbrUDvLv8OEnEqh: { name: "pending_review" } },
       });
 
       for (const h of holds) {
@@ -308,64 +282,41 @@ async function main() {
 
         anomCreates.push({
           fields: {
-            fldjYiDzJmdYJp6uF: {
-              name: h.errorType,
-            },
-            fld3TPgysD2hLbtvR: {
-              name:
-                h.severity === "Critical"
-                  ? "🔴 Critical (Stops Import)"
-                  : "Important",
-            },
-            fldbPrkOy6XavA4ef: {
-              name: "ETL_Script",
-            },
-            fld4li4vcLn43h2N4: {
-              name: "Open",
-            },
+            fldjYiDzJmdYJp6uF: { name: h.errorType },
+            fld3TPgysD2hLbtvR: { name: h.severity },       // ✅ FIX: plain string, no emoji
+            fldbPrkOy6XavA4ef: { name: "ETL_Script" },
+            fld4li4vcLn43h2N4: { name: "Unresolved" },     // ✅ FIX: was "Open"
             fld0wlmRbNFgVpbXS: rawSku.substring(0, 200),
             fldE7JCdKubLvxysd: new Date().toISOString(),
             flddfVzPFP0NjYhVc: false,
             fldB7o9RtnQPi4goY:
               `[${h.label}]\n\n${h.detail}\n\n` +
               `To release: correct the value in Staging → tick Approved here → run Step 3 (Release Approved).`,
-            fldz5hJMgnsZu0T07: [
-              {
-                id: stagingRec.id,
-              },
-            ], // This was correct
+            fldz5hJMgnsZu0T07: [{ id: stagingRec.id }],
           },
         });
+
+        // Register cross-link only when a companion syslog will actually be created
+        if (infoLogs.length > 0) {
+          const syslogIndex = infoLogBatch.length; // ✅ FIX: captured immediately before push
+          holdCorrespondence.push({ anomIndex, syslogIndex });
+
+          infoLogBatch.push({
+            fields: {
+              fld4l6AJhVNRzIaY8:
+                `Script 0B — SKU ${rawSku} HELD. Additional notes:\n` +
+                infoLogs.join("\n---\n"),
+              flda8oHUThBc1Kb7I: { name: "System_Event" },
+              fldPdoc6JPYHV9gpb: { name: "Info" },
+              fldog9l4DwJeE5Qj8: { name: "Logged" },
+              fldJ1v4BeTILLN37J: true, // auto-mark reviewed (informational only)
+              fldjHeNOkAl5rXSQd: [{ id: stagingRec.id }],
+              // fldWXFUMjSnBFAGvd (UPCAdmin link) populated in Step 5b after IDs are known
+            },
+          });
+        }
       }
 
-      // Attach any info logs as a single SystemLog note on this held record
-      if (infoLogs.length > 0) {
-        const syslogIndex = infoLogBatch.length;
-
-        holdCorrespondence.push({ anomIndex, syslogIndex });
-        infoLogBatch.push({
-          fields: {
-            fld4l6AJhVNRzIaY8:
-              `Script 0B — SKU ${rawSku} HELD. Additional notes:\n` +
-              infoLogs.join("\n---\n"),
-            flda8oHUThBc1Kb7I: {
-              name: "System_Event",
-            },
-            fldPdoc6JPYHV9gpb: {
-              name: "Info",
-            },
-            fldog9l4DwJeE5Qj8: {
-              name: "Logged",
-            },
-            fldJ1v4BeTILLN37J: true, // NEW: Mark as reviewed (informational only)
-            fldjHeNOkAl5rXSQd: [
-              {
-                id: stagingRec.id,
-              },
-            ], // FIXED: Changed from `record.id` to `stagingRec.id`
-          },
-        });
-      }
     } else if (infoLogs.length > 0) {
       // Passed — write one SystemLog entry per SKU with all notes combined
       countInfoLogged++;
@@ -374,20 +325,11 @@ async function main() {
           fld4l6AJhVNRzIaY8:
             `Script 0B — SKU ${rawSku} passed with notes:\n` +
             infoLogs.join("\n---\n"),
-          flda8oHUThBc1Kb7I: {
-            name: "System_Event",
-          },
-          fldPdoc6JPYHV9gpb: {
-            name: "Info",
-          },
-          fldog9l4DwJeE5Qj8: {
-            name: "Logged",
-          },
-          fldjHeNOkAl5rXSQd: [
-            {
-              id: stagingRec.id,
-            },
-          ], // FIXED: Changed from `record.id` to `stagingRec.id`
+          flda8oHUThBc1Kb7I: { name: "System_Event" },
+          fldPdoc6JPYHV9gpb: { name: "Info" },
+          fldog9l4DwJeE5Qj8: { name: "Logged" },
+          fldjHeNOkAl5rXSQd: [{ id: stagingRec.id }],
+          // No UPCAdmin link — this SKU passed, no hold exists
         },
       });
     } else {
@@ -402,17 +344,15 @@ async function main() {
   log("## Step 4 — Results");
   log(
     `| Result | Count |\n|---|---|\n` +
-      `| ✅ Clean — flows to Script 1            | ${countClean}         |\n` +
-      `| ℹ️  Passed with notes (SystemLog)        | ${countInfoLogged}    |\n` +
-      `| 🔴 Held — requires Nina approval        | ${countHeld}          |\n` +
-      `| UPCAdmin records to create              | ${anomCreates.length} |\n` +
-      `| SystemLog entries to write              | ${infoLogBatch.length}|`,
+    `| ✅ Clean — flows to Script 1            | ${countClean}         |\n` +
+    `| ℹ️  Passed with notes (SystemLog)        | ${countInfoLogged}    |\n` +
+    `| 🔴 Held — requires Nina approval        | ${countHeld}          |\n` +
+    `| UPCAdmin records to create              | ${anomCreates.length} |\n` +
+    `| SystemLog entries to write              | ${infoLogBatch.length}|`,
   );
 
   if (countHeld === 0 && infoLogBatch.length === 0) {
-    log(
-      "✅ All records passed cleanly. Safe to run Step 4 — Update Product Records.",
-    );
+    log("✅ All records passed cleanly. Safe to run Step 4 — Update Product Records.");
     return;
   }
 
@@ -422,8 +362,8 @@ async function main() {
   log("---");
   log("## Step 5 — Writing...");
 
-  const createdAnomIds = []; // NEW: Capture created UPCAdmin IDs
-  const createdLogIds = []; // NEW: Capture created SystemLog IDs
+  const createdAnomIds = [];
+  const createdLogIds  = [];
 
   try {
     if (stagingUpdates.length > 0) {
@@ -435,7 +375,7 @@ async function main() {
     if (anomCreates.length > 0) {
       for (const b of chunk(anomCreates, 50)) {
         const created = await anomTable.createRecordsAsync(b);
-        createdAnomIds.push(...created.map((r) => r.id)); // NEW: Capture IDs
+        createdAnomIds.push(...created);
       }
       log(`✅ ${anomCreates.length} UPCAdmin records created.`);
     }
@@ -443,59 +383,71 @@ async function main() {
     if (infoLogBatch.length > 0) {
       for (const b of chunk(infoLogBatch, 50)) {
         const created = await adminLogs.createRecordsAsync(b);
-        createdLogIds.push(...created.map((r) => r.id)); // NEW: Capture IDs
+        createdLogIds.push(...created);
       }
       log(`✅ ${infoLogBatch.length} SystemLog notes written.`);
     }
 
-    // NEW: Establish cross-links between SystemLog and UPCAdmin
+    // ──────────────────────────────────────────────────
+    // STEP 5b — Bidirectional cross-links
+    // SystemLog → UPCAdmin  (fldWXFUMjSnBFAGvd on SystemLogs)
+    // UPCAdmin  → SystemLog (fldzDXGns8aBwZAxZ on UPCAdmin — Activity field)
+    // ──────────────────────────────────────────────────
     if (holdCorrespondence.length > 0) {
       log("---");
-      log("## Step 5b — Establishing cross-links...");
+      log("## Step 5b — Establishing bidirectional cross-links...");
+
       const syslogUpdates = [];
+      const anomUpdates   = [];
 
-      for (const pairing of holdCorrespondence) {
-        const anomId = createdAnomIds[pairing.anomIndex];
-        const syslogId = createdLogIds[pairing.syslogIndex];
+      for (const { anomIndex, syslogIndex } of holdCorrespondence) {
+        const anomId   = createdAnomIds[anomIndex];
+        const syslogId = createdLogIds[syslogIndex];
 
-        if (anomId && syslogId) {
-          syslogUpdates.push({
-            id: syslogId,
-            fields: {
-              fldWXFUMjSnBFAGvd: [{ id: anomId }], // NEW: Link SystemLog → UPCAdmin
-            },
-          });
-        }
+        if (!anomId || !syslogId) continue; // safety guard — should not happen
+
+        // SystemLog → UPCAdmin
+        syslogUpdates.push({
+          id: syslogId,
+          fields: {
+            fldWXFUMjSnBFAGvd: [{ id: anomId }],
+          },
+        });
+
+        // UPCAdmin → SystemLog (Activity)
+        anomUpdates.push({
+          id: anomId,
+          fields: {
+            fldzDXGns8aBwZAxZ: [{ id: syslogId }],
+          },
+        });
       }
 
       if (syslogUpdates.length > 0) {
         for (const b of chunk(syslogUpdates, 50))
           await adminLogs.updateRecordsAsync(b);
-        log(
-          `✅ ${syslogUpdates.length} cross-links established (SystemLog ↔ UPCAdmin).`,
-        );
+        log(`✅ ${syslogUpdates.length} SystemLog → UPCAdmin links written.`);
+      }
+
+      if (anomUpdates.length > 0) {
+        for (const b of chunk(anomUpdates, 50))
+          await anomTable.updateRecordsAsync(b);
+        log(`✅ ${anomUpdates.length} UPCAdmin → SystemLog links written.`);
       }
     }
+
   } catch (err) {
     log(`❌ Write error: ${err.message}`);
     try {
-      await adminLogs.createRecordsAsync([
-        {
-          fields: {
-            fld4l6AJhVNRzIaY8: `Script 0B WRITE ERROR: ${err.message}`,
-            flda8oHUThBc1Kb7I: {
-              name: "System_Event",
-            },
-            fldPdoc6JPYHV9gpb: {
-              name: "Critical",
-            },
-            fldog9l4DwJeE5Qj8: {
-              name: "Open",
-            },
-            fldJ1v4BeTILLN37J: false, // NEW: Initialize Reviewed to false
-          },
+      await adminLogs.createRecordsAsync([{
+        fields: {
+          fld4l6AJhVNRzIaY8: `Script 0B WRITE ERROR: ${err.message}`,
+          flda8oHUThBc1Kb7I: { name: "System_Event" },
+          fldPdoc6JPYHV9gpb: { name: "Critical" },
+          fldog9l4DwJeE5Qj8: { name: "Error" },   // ✅ FIX: was "Open"
+          fldJ1v4BeTILLN37J: false,
         },
-      ]);
+      }]);
     } catch (_) {}
     return;
   }
@@ -507,22 +459,23 @@ async function main() {
   log("## ✅ Validation Gate Complete");
   log(
     `| Metric | Count |\n|---|---|\n` +
-      `| Records scanned         | ${pendingRecords.length} |\n` +
-      `| Passed clean            | ${countClean}            |\n` +
-      `| Passed with notes       | ${countInfoLogged}       |\n` +
-      `| Held (needs approval)   | ${countHeld}             |\n` +
-      `| UPCAdmin records created| ${anomCreates.length}    |`,
+    `| Records scanned              | ${pendingRecords.length} |\n` +
+    `| Passed clean                 | ${countClean}            |\n` +
+    `| Passed with notes            | ${countInfoLogged}       |\n` +
+    `| Held (needs approval)        | ${countHeld}             |\n` +
+    `| UPCAdmin records created     | ${anomCreates.length}    |\n` +
+    `| Cross-links established      | ${holdCorrespondence.length} |`,
   );
 
   if (countHeld > 0) {
     log(
       "> **Next steps:**\n" +
-        "> 1. Open Import Hub → Review Queue\n" +
-        "> 2. Review each flagged record — the Notes field explains exactly what to do\n" +
-        "> 3. Correct the Staging record value if needed\n" +
-        "> 4. Tick **Approved** on the UPCAdmin record\n" +
-        "> 5. Run **Step 3 — Release Approved**\n" +
-        "> 6. Then run **Step 4 — Update Product Records**",
+      "> 1. Open Import Hub → Review Queue\n" +
+      "> 2. Review each flagged record — the Notes field explains exactly what to do\n" +
+      "> 3. Correct the Staging record value if needed\n" +
+      "> 4. Tick **Approved** on the UPCAdmin record\n" +
+      "> 5. Run **Step 3 — Release Approved**\n" +
+      "> 6. Then run **Step 4 — Update Product Records**",
     );
   } else {
     log("> ✅ No holds. Run Step 4 — Update Product Records now.");
@@ -530,6 +483,3 @@ async function main() {
 }
 
 await main();
-
-========
-
