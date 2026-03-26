@@ -169,30 +169,30 @@ async function main() {
     );
 
     // --- GENCODE SANITISATION (Decobella Excel coercion guard) ---
-// Fixes two known Excel type-coercion patterns on Decobella stocklist uploads.
-// Logs to SystemLogs whenever a correction fires so Nina has an audit trail.
+    // Fixes two known Excel type-coercion patterns on Decobella stocklist uploads.
+    // Logs to SystemLogs whenever a correction fires so Nina has an audit trail.
 
-const GENCODE_COERCION_WATCH = {
-    "3":      "0003",   // Excel stripped leading zeros
-    "2001-1": "0001-1"  // Excel date-coerced: year 2001, month 1
-};
+    const GENCODE_COERCION_WATCH = {
+      3: "0003", // Excel stripped leading zeros
+      "2001-1": "0001-1", // Excel date-coerced: year 2001, month 1
+    };
 
-function sanitiseGencode(raw) {
-    if (!raw) return null;
-    const s = raw.toString().trim();
+    function sanitiseGencode(raw) {
+      if (!raw) return null;
+      const s = raw.toString().trim();
 
-    // Check known coercion cases first
-    if (GENCODE_COERCION_WATCH[s]) return GENCODE_COERCION_WATCH[s];
+      // Check known coercion cases first
+      if (GENCODE_COERCION_WATCH[s]) return GENCODE_COERCION_WATCH[s];
 
-    // General rule: pure 1-4 digit number → pad to 4 digits
-    if (/^\d{1,4}$/.test(s)) return s.padStart(4, "0");
+      // General rule: pure 1-4 digit number → pad to 4 digits
+      if (/^\d{1,4}$/.test(s)) return s.padStart(4, "0");
 
-    // General rule: 2XXX-N date coercion pattern → 0XXX-N
-    const dateCoerce = s.match(/^2(\d{3})-(\d{1,2})$/);
-    if (dateCoerce) return `0${dateCoerce[1]}-${dateCoerce[2]}`;
+      // General rule: 2XXX-N date coercion pattern → 0XXX-N
+      const dateCoerce = s.match(/^2(\d{3})-(\d{1,2})$/);
+      if (dateCoerce) return `0${dateCoerce[1]}-${dateCoerce[2]}`;
 
-    return s;
-}
+      return s;
+    }
 
     // ── Parse CSV (handles quoted fields, embedded newlines, \r\n)
     const rows = [];
@@ -238,20 +238,20 @@ function sanitiseGencode(raw) {
 
     if (GENCODE_COERCION_WATCH[rawGencode]) {
       infoLogBatch.push({
-          fields: {
-              fld4l6AJhVNRzIaY8:
-                  `⚠️ GENCODE auto-corrected on import\n\n` +
-                  `Original value in file: "${rawGencode}"\n` +
-                  `Corrected to: "${gencode}"\n\n` +
-                  `This is a known Excel formatting issue with the Decobella stocklist. ` +
-                  `The correction has been applied automatically. No action required.`,
-              flda8oHUThBc1Kb7I: { name: "System_Event" },
-              fldPdoc6JPYHV9gpb: { name: "Info" },
-              fldog9l4DwJeE5Qj8: { name: "Logged" },
-              fldJ1v4BeTILLN37J: true, // auto-reviewed, informational only
-          },
+        fields: {
+          fld4l6AJhVNRzIaY8:
+            `⚠️ GENCODE auto-corrected on import\n\n` +
+            `Original value in file: "${rawGencode}"\n` +
+            `Corrected to: "${gencode}"\n\n` +
+            `This is a known Excel formatting issue with the Decobella stocklist. ` +
+            `The correction has been applied automatically. No action required.`,
+          flda8oHUThBc1Kb7I: { name: "System_Event" },
+          fldPdoc6JPYHV9gpb: { name: "Info" },
+          fldog9l4DwJeE5Qj8: { name: "Logged" },
+          fldJ1v4BeTILLN37J: true, // auto-reviewed, informational only
+        },
       });
-  }
+    }
 
     const headers = rows[0].map((h) => h.trim().toUpperCase());
     log(
@@ -394,6 +394,48 @@ function sanitiseGencode(raw) {
     }
 
     log(`✅ ${batchCount} batches written, ${batchErrors} failed`);
+
+    // --- SCRIPT 0 — POST-INGEST LOGGING ---
+    // Drop this at the END of Script 0, after all Staging records are written.
+    // Requires these vars to be tracked during your ingest loop:
+    //   ingestedCount, newCount, skippedCount, failedCount, batchId, sourceFileName
+
+    const SYSTEM_LOGS_TBL = "tblk1v5VHPEC2c2u2"; // SystemLogs
+
+    const SL = {
+      notes: "fld4l6AJhVNRzIaY8", // Notes          (multilineText)
+      systemEvent: "flda8oHUThBc1Kb7I", // System Event   (singleSelect)
+      severity: "fldPdoc6JPYHV9gpb", // Severity       (singleSelect)
+      systemLog: "fldog9l4DwJeE5Qj8", // System Log     (singleSelect)
+      operatorEmail: "fldyYs6l736JsE2iJ", // Operator Email (email)
+      operatorNotes: "fldXtmbbu2ApOWYe4", // Operator Notes (multilineText)
+    };
+
+    const summary = [
+      `📥 Script 0 — Ingest Complete`,
+      `Batch ID   : ${batchId}`,
+      `Source File: ${sourceFileName}`,
+      `Ingested   : ${ingestedCount}`,
+      `New Records: ${newCount}`,
+      `Skipped    : ${skippedCount}`,
+      `Failed     : ${failedCount}`,
+      `Status     : Awaiting Script 0A`,
+      `Timestamp  : ${new Date().toISOString()}`,
+    ].join("\n");
+
+    // 1. Visible in script run panel immediately
+    output.text(summary);
+
+    // 2. Persistent record in SystemLogs
+    const sysLogsTable = base.getTable(SYSTEM_LOGS_TBL);
+    await sysLogsTable.createRecordAsync({
+      [SL.notes]: summary,
+      [SL.systemEvent]: { name: "System_Event" }, // ✅ valid option
+      [SL.severity]: { name: "Info" }, // ✅ valid option
+      [SL.systemLog]: { name: "Logged" }, // ✅ valid option
+      [SL.operatorEmail]: session.currentUser?.email ?? "unknown",
+      [SL.operatorNotes]: `Script 0 ingest run. Next: run Script 0A on ${ingestedCount} pending records.`,
+    });
 
     // ──────────────────────────────────────────────────────
     // STEP 7 — Mark SourceMetadata as Processed

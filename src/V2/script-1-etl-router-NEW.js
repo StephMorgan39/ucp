@@ -83,6 +83,7 @@ const SPD_BOX_PALLET = "fld3SEg2FtEQGpqOA";
 const SPD_SQM_PALLET = "fld1xHQZEyBLByG60";
 const SPD_KG_PALLET = "fldW0kGw6FI6fBXEu";
 const SPD_SRP_EX = "flde8qM0wyidVqrsZ"; // ← v2.2: needed for AVAILABLE guardrail
+const SPD_PEI = "flds7HQW3Aa7Hvtds"; // PEI (singleSelect: PEI2/PEI3/PEI4/PEI5)
 
 // SystemLogs Fields
 const LOG_NOTES = "fld4l6AJhVNRzIaY8";
@@ -440,6 +441,19 @@ async function main() {
             }
           }
 
+          // PEI Class (null-safe — only write if SPD currently empty)
+          const rawPei = stagingRec.getCellValueAsString(S_PEI_CLASS).trim();
+          if (rawPei) {
+            const cleanPei = applyStd("PEI Ratings", rawPei);
+            if (
+              cleanPei &&
+              cleanPei.startsWith("PEI") &&
+              !spdRec?.getCellValueAsString(SPD_PEI)
+            ) {
+              payload[SPD_PEI] = { name: cleanPei };
+            }
+          }
+
           // Description (null-safe — only write if SPD currently empty)
           const rawDesc = stagingRec.getCellValueAsString(S_DESCRIPTION).trim();
           if (rawDesc && spdRec && !spdRec.getCellValueAsString(SPD_DESC)) {
@@ -539,14 +553,19 @@ async function main() {
           }
         }
 
+        // FIX CRITICAL BUG #3: Store current status for optimistic lock check in Step 5
+        const currentStatus = stagingRec.getCellValueAsString(S_ETL_STATUS).trim();
         stagingUpd.push({
           id: stagingRec.id,
+          originalStatus: currentStatus,  // Store original status for lock check
           fields: { [S_ETL_STATUS]: { name: "processed" } },
         });
       } catch (err) {
         countFailed++;
+        const currentStatus = stagingRec.getCellValueAsString(S_ETL_STATUS).trim();
         stagingUpd.push({
           id: stagingRec.id,
+          originalStatus: currentStatus,  // Store original status for lock check
           fields: { [S_ETL_STATUS]: { name: "failed" } },
         });
         systemLogs.push({
@@ -578,9 +597,43 @@ async function main() {
         for (const b of chunk(spdUpdates, 50))
           await spdTable.updateRecordsAsync(b);
 
-      if (stagingUpd.length)
-        for (const b of chunk(stagingUpd, 50))
-          await stagingTable.updateRecordsAsync(b);
+      // FIX CRITICAL BUG #3: Add optimistic lock check before Staging updates
+      // Verify each record is still in "pending" state (not held by 0B or other script)
+      if (stagingUpd.length) {
+        let lockConflicts = 0;
+        let updatesApplied = 0;
+        
+        // Reload current Staging statuses to detect concurrent changes
+        const stagingCheck = await stagingTable.selectRecordsAsync({
+          fields: [S_ETL_STATUS],
+          recordIds: stagingUpd.map(u => u.id)
+        });
+        
+        const currentStatusById = {};
+        for (const rec of stagingCheck.records) {
+          currentStatusById[rec.id] = rec.getCellValueAsString(S_ETL_STATUS).trim();
+        }
+        
+        // Filter: only update records that are still in original state
+        const safeUpdates = stagingUpd.filter(upd => {
+          const current = currentStatusById[upd.id];
+          if (current !== upd.originalStatus && current !== "pending") {
+            lockConflicts++;
+            log(`⚠️ Optimistic lock conflict detected: Record ${upd.id} status changed from "${upd.originalStatus}" to "${current}" — skipping update to preserve hold status`);
+            return false;
+          }
+          updatesApplied++;
+          return true;
+        });
+        
+        if (lockConflicts > 0) {
+          log(`⚠️ WARNING: ${lockConflicts} record(s) held by concurrent process (Script 0B validation) — these have been preserved and not marked "processed"`);
+        }
+        
+        for (const b of chunk(safeUpdates, 50)) {
+          await stagingTable.updateRecordsAsync(b.map(u => ({ id: u.id, fields: u.fields })));
+        }
+      }
 
       if (systemLogs.length)
         for (const b of chunk(systemLogs, 50))

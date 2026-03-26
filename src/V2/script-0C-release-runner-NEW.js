@@ -39,7 +39,8 @@ const STAFF_NAME_FID = "fldGNYm19XawnzbgE"; // FIX: was fldFullName
 // AdminLogs field IDs — FIX: all were placeholder names
 const LOG_NOTES_FID = "fld4l6AJhVNRzIaY8"; // Notes
 const LOG_SEVERITY_FID = "fldPdoc6JPYHV9gpb"; // Severity
-
+const LOG_STATUS_FID = "fldog9l4DwJeE5Qj8"; // Log Status (setting to 'Logged')
+const LOG_OPERATOR_EMAIL_FID = "fldyYs6l736JsE2iJ"; // Operator Email
 const LOG_TYPE_FID = "flda8oHUThBc1Kb7I"; // Anomaly Type
 
 async function main() {
@@ -165,6 +166,8 @@ async function main() {
     })
     .filter(Boolean);
 
+  // FIX CRITICAL BUG #1: Declare alreadyReleased Set before loop (was undefined)
+  const alreadyReleased = new Set();
   const stagingUpdates = [];
   for (const stgRec of stgQuery.records) {
     const status = stgRec.getCellValueAsString("fldbrUDvLv8OEnEqh");
@@ -202,7 +205,7 @@ async function main() {
   }
 
   // ── Step 6: Log ─────────────────────────────────────────
-  // Redundant Supplier table query completely removed to improve script speed
+  // FIX CRITICAL BUG #2 & #3: Use CONFIG constants + fix "System_Event " typo
   await logTable.createRecordsAsync([
     {
       fields: {
@@ -210,11 +213,11 @@ async function main() {
           `Script 0C Release Runner executed.\n` +
           `Operator: ${normEmail}\n` +
           `Anomalies released: ${approved.length}\n` +
-          `Records marked Resolved: ${anomUpdates.length}`,
-        [LOG_SEVERITY_FID]: { name: "System_Event " },
-        [LOG_TYPE_FID]: { name: "System_Event" }, // closest available type for release events
-        fldog9l4DwJeE5Qj8: { name: "Logged" }, // Setting new System Log status
-        fldyYs6l736JsE2iJ: normEmail, // Writing to the new Operator Email field
+          `Staging rows released: ${stagingUpdates.length}`,
+        [LOG_SEVERITY_FID]: { name: "System_Event" },  // FIXED: removed trailing space
+        [LOG_TYPE_FID]: { name: "System_Event" },
+        [LOG_STATUS_FID]: { name: "Logged" },  // FIXED: use CONFIG constant
+        [LOG_OPERATOR_EMAIL_FID]: normEmail,   // FIXED: use CONFIG constant
       },
     },
   ]);
