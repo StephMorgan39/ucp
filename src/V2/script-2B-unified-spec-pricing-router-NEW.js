@@ -41,6 +41,7 @@ const CONFIG = {
       retailExcl: "flde8qM0wyidVqrsZ",
       supplier: "fldY9HQ6d42p8uVoY",
       pmLink: "fldGxaIlPVor7QEwN",
+      pei: "flds7HQW3Aa7Hvtds",
     },
     pm: {
       uomLink: "fldMWdeUtUF8Hgst9",
@@ -96,6 +97,44 @@ const chunk = (arr, n) => {
   return o;
 };
 
+const normStatus = (val) => String(val || "").trim().toLowerCase();
+
+function getStringValue(record, fieldId) {
+  const val = record?.getCellValue(fieldId);
+  if (val === null || val === undefined) return "";
+  if (typeof val === "string") return val;
+  if (typeof val === "number" || typeof val === "boolean") return String(val);
+  if (Array.isArray(val)) {
+    if (!val.length) return "";
+    const first = val[0];
+    if (typeof first === "string") return first;
+    if (first && typeof first === "object") {
+      if ("name" in first) return String(first.name ?? "");
+      if ("id" in first) return String(first.id ?? "");
+    }
+    return "";
+  }
+  if (typeof val === "object" && "name" in val) return String(val.name ?? "");
+  return String(val);
+}
+
+async function logBatchError(sysLogTable, notes) {
+  try {
+    await sysLogTable.createRecordsAsync([
+      {
+        fields: {
+          [CONFIG.fields.systemLogs.notes]: notes,
+          [CONFIG.fields.systemLogs.systemEvent]: { name: "System_Event" },
+          [CONFIG.fields.systemLogs.severity]: { name: "High" },
+          [CONFIG.fields.systemLogs.status]: { name: "Logged" },
+        },
+      },
+    ]);
+  } catch (err) {
+    console.error("Failed to log batch error:", err.message);
+  }
+}
+
 const normSku = (s) =>
   String(s || "").replace(/[-\s]/g, "").trim().toUpperCase();
 
@@ -139,14 +178,18 @@ async function main() {
   const stdEngine = {};
   let skippedRules = 0;
   for (const rec of stdQuery.records) {
-    const feasible = rec.getCellValueAsString(F.standardization.feasible).trim();
-    if (feasible !== "Yes") {
+    const feasible = getStringValue(rec, F.standardization.feasible).trim();
+    if (normStatus(feasible) !== "yes") {
       skippedRules++;
       continue;
     }
-    const category = rec.getCellValueAsString(F.standardization.category).trim().toUpperCase();
-    const input = rec.getCellValueAsString(F.standardization.input).trim().toUpperCase();
-    const output = rec.getCellValueAsString(F.standardization.output).trim();
+    const category = getStringValue(rec, F.standardization.category)
+      .trim()
+      .toUpperCase();
+    const input = getStringValue(rec, F.standardization.input)
+      .trim()
+      .toUpperCase();
+    const output = getStringValue(rec, F.standardization.output).trim();
     if (category && input && output) {
       if (!stdEngine[category]) stdEngine[category] = {};
       stdEngine[category][input] = output;
@@ -174,14 +217,13 @@ async function main() {
       F.staging.thickness,
       F.staging.peiClass,
       F.staging.slipRating,
-      F.staging.bodyFinish,
     ],
   });
 
   const prRecords = stagingQuery.records.filter(
     (r) =>
-      r.getCellValueAsString(F.staging.etlStatus) === "pending" &&
-      r.getCellValueAsString(F.staging.importType).toUpperCase().startsWith("PR")
+      normStatus(getStringValue(r, F.staging.etlStatus)) === "pending" &&
+      getStringValue(r, F.staging.importType).toUpperCase().startsWith("PR")
   );
 
   logUI(`✅ Found **${prRecords.length}** PR records.`);
@@ -199,7 +241,7 @@ async function main() {
 
   const spdById = {};
   for (const rec of spdQuery.records) {
-    const id = rec.getCellValueAsString(F.spd.dataId).trim();
+    const id = getStringValue(rec, F.spd.dataId).trim();
     if (id) spdById[id] = rec;
   }
 
@@ -212,13 +254,16 @@ async function main() {
   const spdUpdates = [];
 
   for (const stagingRec of prRecords) {
-    const rawSku = stagingRec.getCellValueAsString(F.staging.supplierSku).trim();
+    const rawSku = getStringValue(
+      stagingRec,
+      F.staging.supplierSku,
+    ).trim();
     const normSku_ = normSku(rawSku);
 
     // Find matching SPD by normalized SKU (assuming dataId ≈ SKU)
     let spdRec = null;
     for (const [, rec] of Object.entries(spdById)) {
-      if (normSku(rec.getCellValueAsString(F.spd.dataId)) === normSku_) {
+      if (normSku(getStringValue(rec, F.spd.dataId)) === normSku_) {
         spdRec = rec;
         break;
       }
@@ -233,12 +278,16 @@ async function main() {
     const upd = spdUpdate.fields;
 
     // Apply standardization and parse specs
-    const bodyFinish = applyStd("BODY_FINISH", stagingRec.getCellValueAsString(F.staging.bodyFinish));
-    if (bodyFinish) upd[F.spd.supplier] = bodyFinish;
-
-    const peiClass = applyStd("PEI_CLASS", stagingRec.getCellValueAsString(F.staging.peiClass));
+    const peiClass = applyStd(
+      "PEI_CLASS",
+      getStringValue(stagingRec, F.staging.peiClass),
+    );
     if (peiClass) {
-      upd[F.spd.supplier] = peiClass; // Or appropriate field
+      const normalizedPei = String(peiClass).trim().toUpperCase();
+      const allowedPei = new Set(["PEI2", "PEI3", "PEI4", "PEI5"]);
+      if (allowedPei.has(normalizedPei)) {
+        upd[F.spd.pei] = { name: normalizedPei };
+      }
     }
 
     const retailExcl = parseNumeric(stagingRec.getCellValue(F.staging.retailExcl));
@@ -252,7 +301,15 @@ async function main() {
 
   if (spdUpdates.length > 0 && !CONFIG.config.dryRun) {
     for (const b of chunk(spdUpdates, 50)) {
-      await spdTable.updateRecordsAsync(b);
+      try {
+        await spdTable.updateRecordsAsync(b);
+      } catch (err) {
+        await logBatchError(
+          sysLogTable,
+          `Script 2B failed updating SPD batch: ${err.message}`,
+        );
+        throw err;
+      }
     }
     logUI(`✅ Updated **${spdUpdates.length}** SPD records.`);
   } else if (CONFIG.config.dryRun) {
